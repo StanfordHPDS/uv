@@ -27,7 +27,7 @@ use uv_distribution_types::{
     RegistryBuiltDist, RegistryBuiltWheel, RegistrySourceDist, RemoteSource, RequiresPython,
     Resolution, ResolvedDist, SourceDist, ToUrlError, UrlString,
 };
-use uv_fs::{PortablePathBuf, try_relative_to_if};
+use uv_fs::{PortablePathBuf, normalize_path, try_relative_to_if};
 use uv_git::{RepositoryReference, ResolvedRepositoryReference};
 use uv_git_types::{GitLfs, GitOid, GitReference, GitUrl, GitUrlParseError};
 use uv_normalize::{ExtraName, GroupName, PackageName};
@@ -497,7 +497,7 @@ impl<'lock> PylockToml {
                 Dist::Source(SourceDist::Git(dist)) => {
                     package.vcs = Some(PylockTomlVcs {
                         r#type: VcsKind::Git,
-                        url: Some(dist.git.repository().clone()),
+                        url: Some(dist.git.url().clone()),
                         path: None,
                         requested_revision: dist.git.reference().as_str().map(ToString::to_string),
                         commit_id: dist.git.precise().unwrap_or_else(|| {
@@ -794,7 +794,7 @@ impl<'lock> PylockToml {
             let vcs = match &sdist {
                 Some(SourceDist::Git(sdist)) => Some(PylockTomlVcs {
                     r#type: VcsKind::Git,
-                    url: Some(sdist.git.repository().clone()),
+                    url: Some(sdist.git.url().clone()),
                     path: None,
                     requested_revision: sdist.git.reference().as_str().map(ToString::to_string),
                     commit_id: sdist.git.precise().unwrap_or_else(|| {
@@ -1440,12 +1440,12 @@ impl PylockTomlDirectory {
         } else {
             install_path.join(&self.path)
         };
-        let path = uv_fs::normalize_path_buf(path);
+        let path = normalize_path(path);
         let url =
             VerbatimUrl::from_normalized_path(&path).map_err(|_| PylockTomlErrorKind::PathToUrl)?;
         Ok(DirectorySourceDist {
             name: name.clone(),
-            install_path: path.into_boxed_path(),
+            install_path: path.into_owned().into_boxed_path(),
             editable: self.editable,
             r#virtual: Some(false),
             url,

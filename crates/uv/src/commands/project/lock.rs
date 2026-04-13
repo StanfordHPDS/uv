@@ -1,4 +1,4 @@
-#![allow(clippy::single_match_else)]
+#![expect(clippy::single_match_else)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -269,7 +269,7 @@ pub(crate) async fn lock(
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum LockMode<'env> {
+pub(crate) enum LockMode<'env> {
     /// Write the lockfile to disk.
     Write(&'env Interpreter),
     /// Perform a resolution, but don't write the lockfile to disk.
@@ -281,7 +281,7 @@ pub(super) enum LockMode<'env> {
 }
 
 /// A lock operation.
-pub(super) struct LockOperation<'env> {
+pub(crate) struct LockOperation<'env> {
     mode: LockMode<'env>,
     constraints: Vec<NameRequirementSpecification>,
     refresh: Option<&'env Refresh>,
@@ -298,7 +298,7 @@ pub(super) struct LockOperation<'env> {
 
 impl<'env> LockOperation<'env> {
     /// Initialize a [`LockOperation`].
-    pub(super) fn new(
+    pub(crate) fn new(
         mode: LockMode<'env>,
         settings: &'env ResolverSettings,
         client_builder: &'env BaseClientBuilder<'env>,
@@ -328,7 +328,7 @@ impl<'env> LockOperation<'env> {
 
     /// Set the external constraints for the [`LockOperation`].
     #[must_use]
-    pub(super) fn with_constraints(
+    pub(crate) fn with_constraints(
         mut self,
         constraints: Vec<NameRequirementSpecification>,
     ) -> Self {
@@ -338,20 +338,21 @@ impl<'env> LockOperation<'env> {
 
     /// Set the refresh strategy for the [`LockOperation`].
     #[must_use]
-    pub(super) fn with_refresh(mut self, refresh: &'env Refresh) -> Self {
+    pub(crate) fn with_refresh(mut self, refresh: &'env Refresh) -> Self {
         self.refresh = Some(refresh);
         self
     }
 
     /// Perform a [`LockOperation`].
-    pub(super) async fn execute(self, target: LockTarget<'_>) -> Result<LockResult, ProjectError> {
+    pub(crate) async fn execute(self, target: LockTarget<'_>) -> Result<LockResult, ProjectError> {
         match self.mode {
             LockMode::Frozen(source) => {
                 // Read the existing lockfile, but don't attempt to lock the project.
+                let lock_filename = target.lock_filename();
                 let existing = target
                     .read()
                     .await?
-                    .ok_or(ProjectError::MissingLockfile(source))?;
+                    .ok_or(ProjectError::MissingLockfile(source, lock_filename))?;
 
                 // Check if the discovered workspace members match the locked workspace members.
                 if let LockTarget::Workspace(workspace) = target {
@@ -368,10 +369,11 @@ impl<'env> LockOperation<'env> {
             }
             LockMode::Locked(interpreter, lock_source) => {
                 // Read the existing lockfile.
-                let existing = target
-                    .read()
-                    .await?
-                    .ok_or(ProjectError::MissingLockfile(lock_source.into()))?;
+                let lock_filename = target.lock_filename();
+                let existing = target.read().await?.ok_or(ProjectError::MissingLockfile(
+                    lock_source.into(),
+                    lock_filename,
+                ))?;
 
                 // Perform the lock operation, but don't write the lockfile to disk.
                 let result = Box::pin(do_lock(
@@ -541,7 +543,7 @@ async fn do_lock(
         .collect::<Result<BTreeMap<_, _>, ProjectError>>()?;
 
     // Collect the conflicts.
-    let mut conflicts = target.conflicts();
+    let mut conflicts = target.conflicts()?;
     if let LockTarget::Workspace(workspace) = target {
         if let Some(groups) = &workspace.pyproject_toml().dependency_groups {
             if let Some(project) = &workspace.pyproject_toml().project {
@@ -701,7 +703,7 @@ async fn do_lock(
         .index_strategy(*index_strategy)
         .markers(interpreter.markers())
         .platform(interpreter.platform())
-        .build();
+        .build()?;
 
     // Determine whether to enable build isolation.
     let environment;
@@ -913,7 +915,7 @@ async fn do_lock(
             );
 
             // Resolve the requirements.
-            let resolution = pip::operations::resolve(
+            let (resolution, _) = pip::operations::resolve(
                 ExtrasResolver::new(&hasher, state.index(), database)
                     .with_reporter(Arc::new(ResolverReporter::from(printer)))
                     .resolve(target.members_requirements())
@@ -1197,10 +1199,12 @@ impl ValidatedLock {
             return Ok(Self::Preferable(lock));
         }
 
-        // If the user specified `--upgrade-package`, then at best we can prefer some of
-        // the existing versions.
+        // If the user specified `--upgrade-package` or `--upgrade-group`, then at best we can
+        // prefer some of the existing versions.
         if !(upgrade.is_none() || upgrade.is_all()) {
-            debug!("Resolving despite existing lockfile due to `--upgrade-package`");
+            debug!(
+                "Resolving despite existing lockfile due to `--upgrade-package` or `--upgrade-group`"
+            );
             return Ok(Self::Preferable(lock));
         }
 

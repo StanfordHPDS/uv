@@ -14,7 +14,9 @@ use uv_cache::{Cache, Refresh};
 use uv_cache_info::Timestamp;
 use uv_client::{BaseClientBuilder, RegistryClientBuilder};
 use uv_configuration::{Concurrency, IndexStrategy, KeyringProviderType};
-use uv_distribution_types::{Diagnostic, IndexCapabilities, IndexLocations, Name, RequiresPython};
+use uv_distribution_types::{
+    DependencyMetadata, Diagnostic, IndexCapabilities, IndexLocations, Name, RequiresPython,
+};
 use uv_installer::SitePackages;
 use uv_normalize::PackageName;
 use uv_pep440::{Operator, Version, VersionSpecifier, VersionSpecifiers};
@@ -48,6 +50,7 @@ pub(crate) async fn pip_tree(
     concurrency: Concurrency,
     strict: bool,
     exclude_newer: ExcludeNewer,
+    dependency_metadata: &DependencyMetadata,
     python: Option<&str>,
     system: bool,
     cache: &Cache,
@@ -88,6 +91,7 @@ pub(crate) async fn pip_tree(
         let capabilities = IndexCapabilities::default();
 
         let client_builder = client_builder.keyring(keyring_provider);
+        let latest_index_locations = index_locations.clone();
 
         // Initialize the registry client.
         let client = RegistryClientBuilder::new(
@@ -98,7 +102,7 @@ pub(crate) async fn pip_tree(
         .index_strategy(index_strategy)
         .markers(environment.interpreter().markers())
         .platform(environment.interpreter().platform())
-        .build();
+        .build()?;
         let download_concurrency = concurrency.downloads_semaphore.clone();
 
         // Determine the platform tags.
@@ -113,6 +117,7 @@ pub(crate) async fn pip_tree(
             capabilities: &capabilities,
             prerelease,
             exclude_newer: &exclude_newer,
+            index_locations: &latest_index_locations,
             tags: Some(tags),
             requires_python: Some(&requires_python),
         };
@@ -175,7 +180,7 @@ pub(crate) async fn pip_tree(
 
     // Validate that the environment is consistent.
     if strict {
-        for diagnostic in site_packages.diagnostics(&markers, tags)? {
+        for diagnostic in site_packages.diagnostics(&markers, tags, dependency_metadata)? {
             writeln!(
                 printer.stderr(),
                 "{}{} {}",

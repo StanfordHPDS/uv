@@ -11,11 +11,11 @@ use tracing::{debug, trace, warn};
 
 use uv_configuration::DependencyGroupsWithDefaults;
 use uv_distribution_types::{Index, Requirement, RequirementSource};
-use uv_fs::{CWD, Simplified};
+use uv_fs::{CWD, Simplified, normalize_path};
 use uv_normalize::{DEV_DEPENDENCIES, GroupName, PackageName};
 use uv_pep440::VersionSpecifiers;
 use uv_pep508::{MarkerTree, VerbatimUrl};
-use uv_pypi_types::{Conflicts, SupportedEnvironments, VerbatimParsedUrl};
+use uv_pypi_types::{ConflictError, Conflicts, SupportedEnvironments, VerbatimParsedUrl};
 use uv_static::EnvVars;
 use uv_warnings::warn_user_once;
 
@@ -81,6 +81,8 @@ pub enum WorkspaceError {
     Io(#[from] std::io::Error),
     #[error("Failed to parse: `{}`", _0.user_display())]
     Toml(PathBuf, #[source] Box<PyprojectTomlError>),
+    #[error(transparent)]
+    Conflicts(#[from] ConflictError),
     #[error("Failed to normalize workspace member path")]
     Normalize(#[source] std::io::Error),
 }
@@ -191,10 +193,7 @@ impl Workspace {
         let path = std::path::absolute(path)
             .map_err(WorkspaceError::Normalize)?
             .clone();
-        // Remove `.` and `..`
-        let path = uv_fs::normalize_path(&path);
-        // Trim trailing slashes.
-        let path = path.components().collect::<PathBuf>();
+        let path = normalize_path(&path);
 
         let project_path = path
             .ancestors()
@@ -548,12 +547,24 @@ impl Workspace {
     }
 
     /// Returns the set of conflicts for the workspace.
-    pub fn conflicts(&self) -> Conflicts {
+    pub fn conflicts(&self) -> Result<Conflicts, WorkspaceError> {
         let mut conflicting = Conflicts::empty();
+        if self.is_non_project() {
+            if let Some(root_conflicts) = self
+                .pyproject_toml
+                .tool
+                .as_ref()
+                .and_then(|tool| tool.uv.as_ref())
+                .and_then(|uv| uv.conflicts.as_ref())
+            {
+                let mut root_conflicts = root_conflicts.to_conflicts()?;
+                conflicting.append(&mut root_conflicts);
+            }
+        }
         for member in self.packages.values() {
             conflicting.append(&mut member.pyproject_toml.conflicts());
         }
-        conflicting
+        Ok(conflicting)
     }
 
     /// Returns an iterator over the `requires-python` values for each member of the workspace.
@@ -973,7 +984,7 @@ impl Workspace {
         // Add all other workspace members.
         for member_glob in workspace_definition.clone().members.unwrap_or_default() {
             // Normalize the member glob to remove leading `./` and other relative path components
-            let normalized_glob = uv_fs::normalize_path(Path::new(member_glob.as_str()));
+            let normalized_glob = normalize_path(Path::new(member_glob.as_str()));
             let absolute_glob = PathBuf::from(glob::Pattern::escape(
                 workspace_root.simplified().to_string_lossy().as_ref(),
             ))
@@ -1386,10 +1397,7 @@ impl ProjectWorkspace {
         let project_path = std::path::absolute(install_path)
             .map_err(WorkspaceError::Normalize)?
             .clone();
-        // Remove `.` and `..`
-        let project_path = uv_fs::normalize_path(&project_path);
-        // Trim trailing slashes.
-        let project_path = project_path.components().collect::<PathBuf>();
+        let project_path = normalize_path(&project_path);
 
         // Check if workspaces are explicitly disabled for the project.
         if project_pyproject_toml
@@ -1400,7 +1408,7 @@ impl ProjectWorkspace {
             == Some(false)
         {
             debug!("Project `{}` is marked as unmanaged", project.name);
-            return Err(WorkspaceError::NonWorkspace(project_path));
+            return Err(WorkspaceError::NonWorkspace(project_path.to_path_buf()));
         }
 
         // Check if the current project is also an explicit workspace root.
@@ -1411,7 +1419,7 @@ impl ProjectWorkspace {
             .and_then(|uv| uv.workspace.as_ref())
             .map(|workspace| {
                 (
-                    project_path.clone(),
+                    project_path.to_path_buf(),
                     workspace.clone(),
                     project_pyproject_toml.clone(),
                 )
@@ -1424,7 +1432,7 @@ impl ProjectWorkspace {
         }
 
         let current_project = WorkspaceMember {
-            root: project_path.clone(),
+            root: project_path.to_path_buf(),
             project: project.clone(),
             pyproject_toml: project_pyproject_toml.clone(),
         };
@@ -1447,10 +1455,10 @@ impl ProjectWorkspace {
             )?;
 
             return Ok(Self {
-                project_root: project_path.clone(),
+                project_root: project_path.to_path_buf(),
                 project_name: project.name.clone(),
                 workspace: Workspace {
-                    install_path: project_path.clone(),
+                    install_path: project_path.to_path_buf(),
                     packages: current_project_as_members,
                     required_members,
                     // There may be package sources, but we don't need to duplicate them into the
@@ -1478,7 +1486,7 @@ impl ProjectWorkspace {
         .await?;
 
         Ok(Self {
-            project_root: project_path,
+            project_root: project_path.to_path_buf(),
             project_name: project.name.clone(),
             workspace,
         })
@@ -1623,7 +1631,7 @@ fn is_excluded_from_workspace(
 ) -> Result<bool, WorkspaceError> {
     for exclude_glob in workspace.exclude.iter().flatten() {
         // Normalize the exclude glob to remove leading `./` and other relative path components
-        let normalized_glob = uv_fs::normalize_path(Path::new(exclude_glob.as_str()));
+        let normalized_glob = normalize_path(Path::new(exclude_glob.as_str()));
         let absolute_glob = PathBuf::from(glob::Pattern::escape(
             workspace_root.simplified().to_string_lossy().as_ref(),
         ))
@@ -1646,11 +1654,11 @@ fn is_included_in_workspace(
 ) -> Result<bool, WorkspaceError> {
     for member_glob in workspace.members.iter().flatten() {
         // Normalize the member glob to remove leading `./` and other relative path components
-        let normalized_glob = uv_fs::normalize_path(Path::new(member_glob.as_str()));
+        let normalized_glob = normalize_path(Path::new(member_glob.as_str()));
         let absolute_glob = PathBuf::from(glob::Pattern::escape(
             workspace_root.simplified().to_string_lossy().as_ref(),
         ))
-        .join(normalized_glob.as_ref());
+        .join(normalized_glob);
         let absolute_glob = absolute_glob.to_string_lossy();
         let include_pattern = glob::Pattern::new(&absolute_glob)
             .map_err(|err| WorkspaceError::Pattern(absolute_glob.to_string(), err))?;

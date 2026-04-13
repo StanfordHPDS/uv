@@ -600,6 +600,76 @@ fn sync_json() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn sync_json_check_outdated_environment() -> Result<()> {
+    let context = uv_test::test_context!("3.12")
+        .with_filtered_python_names()
+        .with_filtered_virtualenv_bin();
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["iniconfig"]
+        "#,
+    )?;
+
+    uv_snapshot!(context.filters(), context.sync()
+        .arg("--check")
+        .arg("--output-format").arg("json"), @r#"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    {
+      "schema": {
+        "version": "preview"
+      },
+      "target": "project",
+      "project": {
+        "path": "[TEMP_DIR]/",
+        "workspace": {
+          "path": "[TEMP_DIR]/"
+        }
+      },
+      "sync": {
+        "environment": {
+          "path": "[VENV]/",
+          "python": {
+            "path": "[VENV]/[BIN]/[PYTHON]",
+            "version": "3.12.[X]",
+            "implementation": "cpython"
+          }
+        },
+        "action": "check",
+        "changes": [
+          {
+            "name": "iniconfig",
+            "version": "2.0.0",
+            "action": "installed"
+          }
+        ]
+      },
+      "lock": {
+        "path": "[TEMP_DIR]/uv.lock",
+        "action": "create"
+      },
+      "dry_run": true
+    }
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Would download 1 package
+    Would install 1 package
+     + iniconfig==2.0.0
+    The environment is outdated; run `uv sync` to update the environment
+    "#);
+
+    Ok(())
+}
+
 /// Test --dry json output
 #[test]
 fn sync_dry_json() -> Result<()> {
@@ -4964,6 +5034,80 @@ fn sync_group_self() -> Result<()> {
     Ok(())
 }
 
+/// Regression test for: <https://github.com/astral-sh/uv/issues/14645>
+#[test]
+fn sync_workspace_member_group_self_conflicting_extra() -> Result<()> {
+    let context = uv_test::test_context!("3.12").with_filtered_counts();
+
+    context.temp_dir.child("pyproject.toml").write_str(
+        r#"
+        [tool.uv.workspace]
+        members = ["member"]
+        "#,
+    )?;
+
+    let member = context.temp_dir.child("member");
+    member.child("pyproject.toml").write_str(
+        r#"
+        [project]
+        name = "member"
+        version = "0.0.0"
+        requires-python = ">=3.12"
+
+        [project.optional-dependencies]
+        cpu = ["idna>=3"]
+        gpu = []
+
+        [dependency-groups]
+        ci = ["member[cpu]"]
+
+        [build-system]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
+
+        [tool.uv]
+        package = true
+        conflicts = [
+          [
+            { extra = "cpu" },
+            { extra = "gpu" },
+          ],
+        ]
+        "#,
+    )?;
+    member
+        .child("src")
+        .child("member")
+        .child("__init__.py")
+        .touch()?;
+
+    uv_snapshot!(
+        context.filters(),
+        context
+            .sync()
+            .arg("--package")
+            .arg("member")
+            .arg("--group")
+            .arg("ci"),
+        @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved [N] packages in [TIME]
+    Prepared [N] packages in [TIME]
+    Installed [N] packages in [TIME]
+     + idna==3.6
+     + member==0.0.0 (from file://[TEMP_DIR]/member)
+    "
+    );
+
+    context.assert_command("import idna").success();
+
+    Ok(())
+}
+
 #[test]
 fn sync_non_existent_extra() -> Result<()> {
     let context = uv_test::test_context!("3.12");
@@ -5401,6 +5545,79 @@ fn read_metadata_statically_over_the_cache() -> Result<()> {
     let lock2 = context.read("uv.lock");
     // Assert stability.
     assert_eq!(lock1, lock2);
+
+    Ok(())
+}
+
+/// Accept equivalent singular version intervals in static `requires-dist` metadata.
+///
+/// See: <https://github.com/astral-sh/uv/issues/17639>
+#[test]
+fn no_install_project_singular_interval_requires_dist() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "project"
+        requires-python = ">=3.12"
+        dynamic = ["version"]
+        dependencies = ["iniconfig>=2.0.0,<=2.0.0"]
+
+        [build-system]
+        requires = ["hatchling"]
+        build-backend = "hatchling.build"
+
+        [tool.uv]
+        cache-keys = [{ file = "pyproject.toml" }, { file = "src/__about__.py" }]
+
+        [tool.hatch.version]
+        path = "src/__about__.py"
+        scheme = "standard"
+        "#,
+    )?;
+    context
+        .temp_dir
+        .child("src")
+        .child("__about__.py")
+        .write_str("__version__ = '0.1.0'")?;
+    context
+        .temp_dir
+        .child("src")
+        .child("project")
+        .child("__init__.py")
+        .touch()?;
+
+    context.lock().assert().success();
+
+    let lock_path = context.temp_dir.join("uv.lock");
+    let lock = fs_err::read_to_string(&lock_path)?;
+    let lock = lock.replacen(
+        r#"requires-dist = [{ name = "iniconfig", specifier = ">=2.0.0,<=2.0.0" }]"#,
+        r#"requires-dist = [{ name = "iniconfig", specifier = "<=2.0.0,>=2.0.0" }]"#,
+        1,
+    );
+    assert!(
+        lock.contains(r#"requires-dist = [{ name = "iniconfig", specifier = "<=2.0.0,>=2.0.0" }]"#),
+        "expected to rewrite the dynamic package metadata in `uv.lock`"
+    );
+    fs_err::write(&lock_path, lock)?;
+
+    fs_err::remove_dir_all(&context.cache_dir)?;
+    fs_err::remove_file(context.temp_dir.join("src").join("__about__.py"))?;
+
+    uv_snapshot!(context.filters(), context.sync().arg("--locked").arg("--no-install-project"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + iniconfig==2.0.0
+    ");
 
     Ok(())
 }

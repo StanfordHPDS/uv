@@ -19,7 +19,7 @@ use uv_configuration::{
 use uv_dispatch::BuildDispatch;
 use uv_distribution::{DistributionDatabase, SourcedDependencyGroups};
 use uv_distribution_types::{
-    CachedDist, Diagnostic, Dist, InstalledDist, InstalledVersion, LocalDist,
+    CachedDist, DependencyMetadata, Diagnostic, Dist, InstalledDist, InstalledVersion, LocalDist,
     NameRequirementSpecification, Requirement, ResolutionDiagnostic, UnresolvedRequirement,
     UnresolvedRequirementSpecification, VersionOrUrlRef,
 };
@@ -41,7 +41,7 @@ use uv_requirements::{
 };
 use uv_resolver::{
     DependencyMode, Exclusions, FlatIndex, InMemoryIndex, Manifest, Options, Preference,
-    Preferences, PythonRequirement, Resolver, ResolverEnvironment, ResolverOutput,
+    Preferences, PythonRequirement, Resolver, ResolverEnvironment, ResolverOutput, UpgradePackages,
 };
 use uv_tool::InstalledTools;
 use uv_types::{BuildContext, HashStrategy, InFlight, InstalledPackagesProvider};
@@ -132,7 +132,7 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
     options: Options,
     logger: Box<dyn ResolveLogger>,
     printer: Printer,
-) -> Result<ResolverOutput, Error> {
+) -> Result<(ResolverOutput, HashStrategy), Error> {
     let start = std::time::Instant::now();
 
     // Resolve the requirements from the provided sources.
@@ -265,6 +265,11 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
         requirements
     };
 
+    // Incorporate hashes from requirements discovered while resolving source trees and groups.
+    let mut hasher = hasher
+        .clone()
+        .augment_with_requirements(requirements.iter())?;
+
     // Resolve the overrides from the provided sources.
     let overrides = {
         // Partition the overrides into named and unnamed requirements.
@@ -284,7 +289,7 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
         if !unnamed.is_empty() {
             overrides.extend(
                 NamedRequirementsResolver::new(
-                    hasher,
+                    &hasher,
                     index,
                     DistributionDatabase::new(
                         client,
@@ -315,11 +320,11 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
     // Determine any lookahead requirements.
     let lookaheads = match options.dependency_mode {
         DependencyMode::Transitive => {
-            LookaheadResolver::new(
+            let (lookaheads, updated_hasher) = LookaheadResolver::new(
                 &requirements,
                 &constraints,
                 &overrides,
-                hasher,
+                &hasher,
                 index,
                 DistributionDatabase::new(
                     client,
@@ -329,13 +334,15 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
             )
             .with_reporter(Arc::new(ResolverReporter::from(printer)))
             .resolve(&resolver_env)
-            .await?
+            .await?;
+            hasher = updated_hasher;
+            lookaheads
         }
         DependencyMode::Direct => Vec::new(),
     };
 
     // TODO(zanieb): Consider consuming these instead of cloning
-    let exclusions = Exclusions::new(reinstall.clone(), upgrade.clone());
+    let exclusions = Exclusions::new(reinstall.clone(), UpgradePackages::for_non_project(upgrade));
 
     // Create a manifest of the requirements.
     let manifest = Manifest::new(
@@ -370,7 +377,7 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
             tags,
             flat_index,
             index,
-            hasher,
+            &hasher,
             build_dispatch,
             installed_packages,
             DistributionDatabase::new(
@@ -386,7 +393,7 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
 
     logger.on_complete(resolution.len(), start, printer)?;
 
-    Ok(resolution)
+    Ok((resolution, hasher))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -799,8 +806,9 @@ async fn execute_plan(
     if !uninstalls.is_empty() {
         let start = std::time::Instant::now();
 
+        let layout = venv.interpreter().layout();
         for dist_info in &uninstalls {
-            match uv_installer::uninstall(dist_info).await {
+            match uv_installer::uninstall(dist_info, &layout).await {
                 Ok(summary) => {
                     debug!(
                         "Uninstalled {} ({} file{}, {} director{})",
@@ -1038,7 +1046,7 @@ fn report_dry_run(
     logger.on_complete(&changelog, printer, dry_run)?;
 
     if matches!(dry_run, DryRun::Check) {
-        return Err(Error::OutdatedEnvironment);
+        return Err(Error::OutdatedEnvironment(Box::new(changelog)));
     }
 
     Ok(changelog)
@@ -1067,10 +1075,11 @@ pub(crate) fn diagnose_environment(
     venv: &PythonEnvironment,
     markers: &ResolverMarkerEnvironment,
     tags: &Tags,
+    dependency_metadata: &DependencyMetadata,
     printer: Printer,
 ) -> Result<(), Error> {
     let site_packages = SitePackages::from_environment(venv)?;
-    for diagnostic in site_packages.diagnostics(markers, tags)? {
+    for diagnostic in site_packages.diagnostics(markers, tags, dependency_metadata)? {
         // Only surface diagnostics that are "relevant" to the current resolution.
         if resolution
             .distributions()
@@ -1115,5 +1124,5 @@ pub(crate) enum Error {
     Anyhow(#[from] anyhow::Error),
 
     #[error("The environment is outdated; run `{}` to update the environment", "uv sync".cyan())]
-    OutdatedEnvironment,
+    OutdatedEnvironment(Box<Changelog>),
 }

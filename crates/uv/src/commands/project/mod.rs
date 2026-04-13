@@ -27,7 +27,7 @@ use uv_installer::{InstallationStrategy, SatisfiesResult, SitePackages};
 use uv_normalize::{DEV_DEPENDENCIES, DefaultGroups, ExtraName, GroupName, PackageName};
 use uv_pep440::{TildeVersionSpecifier, Version, VersionSpecifiers};
 use uv_pep508::MarkerTreeContents;
-use uv_preview::{Preview, PreviewFeature};
+use uv_preview::Preview;
 use uv_pypi_types::{ConflictItem, ConflictKind, ConflictSet, Conflicts};
 use uv_python::{
     BrokenLink, EnvironmentPreference, Interpreter, InvalidEnvironmentKind, PythonDownloads,
@@ -70,7 +70,7 @@ pub(crate) mod format;
 pub(crate) mod init;
 mod install_target;
 pub(crate) mod lock;
-mod lock_target;
+pub(crate) mod lock_target;
 pub(crate) mod remove;
 pub(crate) mod run;
 pub(crate) mod sync;
@@ -139,9 +139,9 @@ pub(crate) enum ProjectError {
     LockMismatch(Option<Box<Lock>>, Box<Lock>, LockCheckSource),
 
     #[error(
-        "Unable to find lockfile at `uv.lock`, but {0} was provided. To create a lockfile, run `uv lock` or `uv sync` without the flag."
+        "Unable to find lockfile at `{1}`, but {0} was provided. To create a lockfile, run `uv lock` or `uv sync` without the flag."
     )]
-    MissingLockfile(MissingLockfileSource),
+    MissingLockfile(MissingLockfileSource, PathBuf),
 
     #[error(
         "The lockfile at `uv.lock` needs to be updated, but `--frozen` was provided: Missing workspace member `{0}`. To update the lockfile, run `uv lock`."
@@ -277,6 +277,9 @@ pub(crate) enum ProjectError {
 
     #[error(transparent)]
     Client(#[from] uv_client::Error),
+
+    #[error(transparent)]
+    ClientBuild(#[from] uv_client::ClientBuildError),
 
     #[error(transparent)]
     Python(#[from] uv_python::Error),
@@ -1419,10 +1422,9 @@ impl ProjectEnvironment {
             })
             .ok();
 
-        let upgradeable = preview.is_enabled(PreviewFeature::PythonUpgrade)
-            && python
-                .as_ref()
-                .is_none_or(|request| !request.includes_patch());
+        let upgradeable = python
+            .as_ref()
+            .is_none_or(|request| !request.includes_patch());
 
         match ProjectInterpreter::discover(
             workspace,
@@ -1876,7 +1878,8 @@ pub(crate) async fn resolve_names(
         .torch_backend(torch_backend.clone())
         .markers(interpreter.markers())
         .platform(interpreter.platform())
-        .build();
+        .build()
+        .map_err(std::io::Error::other)?;
 
     // Determine whether to enable build isolation.
     let environment;
@@ -2074,7 +2077,7 @@ pub(crate) async fn resolve_environment(
         .torch_backend(torch_backend.clone())
         .markers(interpreter.markers())
         .platform(interpreter.platform())
-        .build();
+        .build()?;
 
     // Determine whether to enable build isolation.
     let environment;
@@ -2199,7 +2202,8 @@ pub(crate) async fn resolve_environment(
         logger,
         printer,
     )
-    .await?)
+    .await?
+    .0)
 }
 
 /// Sync a [`PythonEnvironment`] with a set of resolved requirements.
@@ -2250,7 +2254,7 @@ pub(crate) async fn sync_environment(
         .index_strategy(index_strategy)
         .markers(interpreter.markers())
         .platform(interpreter.platform())
-        .build();
+        .build()?;
 
     // Determine whether to enable build isolation.
     let build_isolation = match build_isolation {
@@ -2498,7 +2502,7 @@ pub(crate) async fn update_environment(
         .torch_backend(torch_backend.clone())
         .markers(interpreter.markers())
         .platform(interpreter.platform())
-        .build();
+        .build()?;
 
     // Determine whether to enable build isolation.
     let build_isolation = match build_isolation {
@@ -2565,7 +2569,7 @@ pub(crate) async fn update_environment(
     );
 
     // Resolve the requirements.
-    let resolution = match pip::operations::resolve(
+    let (resolution, hasher) = match pip::operations::resolve(
         requirements,
         constraints,
         overrides,
@@ -2596,7 +2600,7 @@ pub(crate) async fn update_environment(
     )
     .await
     {
-        Ok(resolution) => Resolution::from(resolution),
+        Ok((resolution, hasher)) => (Resolution::from(resolution), hasher),
         Err(err) => return Err(err.into()),
     };
 

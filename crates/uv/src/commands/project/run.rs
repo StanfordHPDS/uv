@@ -74,7 +74,8 @@ use crate::commands::reporters::PythonDownloadReporter;
 use crate::commands::{ExitStatus, diagnostics, project};
 use crate::printer::Printer;
 use crate::settings::{
-    FrozenSource, GlobalSettings, LockCheck, ResolverInstallerSettings, ResolverSettings,
+    FrozenSource, GlobalSettings, LockCheck, LockCheckSource, ResolverInstallerSettings,
+    ResolverSettings,
 };
 
 /// Run a command.
@@ -359,18 +360,40 @@ hint: If you are running a script with `{}` in the shebang, you may need to incl
 
             Some(environment.into_interpreter())
         } else {
-            // If no lockfile is found, warn against `--locked` and `--frozen`.
+            // If no lockfile is found, error for `--locked` and `--frozen` when provided
+            // via CLI. For environment variables and configuration, warn instead to avoid
+            // breaking users who set `UV_LOCKED=1` globally.
             if let LockCheck::Enabled(lock_check) = lock_check {
-                warn_user!(
-                    "No lockfile found for Python script (ignoring `{lock_check}`); run `{}` to generate a lockfile",
-                    "uv lock --script".green(),
-                );
+                match lock_check {
+                    LockCheckSource::LockedCli | LockCheckSource::Check => {
+                        bail!(
+                            "Unable to find lockfile for Python script, but `{lock_check}` was provided. To create a lockfile, run `{}`.",
+                            "uv lock --script".green(),
+                        );
+                    }
+                    LockCheckSource::LockedEnv | LockCheckSource::LockedConfiguration => {
+                        warn_user!(
+                            "No lockfile found for Python script (ignoring `{lock_check}`); run `{}` to generate a lockfile",
+                            "uv lock --script".green(),
+                        );
+                    }
+                }
             }
-            if frozen.is_some() {
-                warn_user!(
-                    "No lockfile found for Python script (ignoring `--frozen`); run `{}` to generate a lockfile",
-                    "uv lock --script".green(),
-                );
+            if let Some(frozen_source) = frozen {
+                match frozen_source {
+                    FrozenSource::Cli => {
+                        bail!(
+                            "Unable to find lockfile for Python script, but `--frozen` was provided. To create a lockfile, run `{}`.",
+                            "uv lock --script".green(),
+                        );
+                    }
+                    FrozenSource::Env | FrozenSource::Configuration => {
+                        warn_user!(
+                            "No lockfile found for Python script (ignoring `--frozen`); run `{}` to generate a lockfile",
+                            "uv lock --script".green(),
+                        );
+                    }
+                }
             }
 
             // Install the script requirements, if necessary. Otherwise, use an isolated environment.
@@ -1620,7 +1643,7 @@ impl ParsedRunCommand {
         mut url: &DisplaySafeUrl,
         client_builder: &BaseClientBuilder<'_>,
     ) -> anyhow::Result<tempfile::NamedTempFile> {
-        let client = client_builder.build();
+        let client = client_builder.build()?;
         let mut response = client
             .for_host(url)
             .get(Url::from(url.clone()))
@@ -1944,7 +1967,7 @@ async fn resolve_gist_url(
     // Build the API URL.
     let api_url = format!("https://api.github.com/gists/{gist_id}");
 
-    let client = client_builder.build();
+    let client = client_builder.build()?;
 
     // Build the request with appropriate headers.
     let api_url_parsed = DisplaySafeUrl::parse(&api_url)?;

@@ -34,7 +34,7 @@ use uv_distribution_types::{
     RemoteSource, Requirement, RequirementSource, RequiresPython, ResolvedDist,
     SimplifiedMarkerTree, StaticMetadata, ToUrlError, UrlString,
 };
-use uv_fs::{PortablePath, PortablePathBuf, Simplified, try_relative_to_if};
+use uv_fs::{PortablePath, PortablePathBuf, Simplified, normalize_path, try_relative_to_if};
 use uv_git::{RepositoryReference, ResolvedRepositoryReference};
 use uv_git_types::{GitLfs, GitOid, GitReference, GitUrl, GitUrlParseError};
 use uv_normalize::{ExtraName, GroupName, PackageName};
@@ -54,19 +54,18 @@ use uv_small_str::SmallString;
 use uv_types::{BuildContext, HashStrategy};
 use uv_workspace::{Editability, WorkspaceMember};
 
-use crate::exclude_newer::ExcludeNewerSpan;
 use crate::fork_strategy::ForkStrategy;
 pub(crate) use crate::lock::export::PylockTomlPackage;
 pub use crate::lock::export::RequirementsTxtExport;
-pub use crate::lock::export::{PylockToml, PylockTomlErrorKind, cyclonedx_json};
+pub use crate::lock::export::{Metadata, PylockToml, PylockTomlErrorKind, cyclonedx_json};
 pub use crate::lock::installable::Installable;
 pub use crate::lock::map::PackageMap;
 pub use crate::lock::tree::TreeDisplay;
 use crate::resolution::{AnnotatedDist, ResolutionGraphNode};
 use crate::universal_marker::{ConflictMarker, UniversalMarker};
 use crate::{
-    ExcludeNewer, ExcludeNewerPackage, ExcludeNewerValue, InMemoryIndex, MetadataResponse,
-    PackageExcludeNewer, PrereleaseMode, ResolutionMode, ResolverOutput,
+    ExcludeNewer, ExcludeNewerOverride, ExcludeNewerPackage, ExcludeNewerSpan, ExcludeNewerValue,
+    InMemoryIndex, MetadataResponse, PrereleaseMode, ResolutionMode, ResolverOutput,
 };
 
 mod export;
@@ -349,19 +348,16 @@ impl Lock {
             // If there are multiple distributions for the same package, include the markers of all
             // forks that included the current distribution.
             //
-            // Normalize with a simplify/complexify round-trip through `requires-python` to
-            // match markers deserialized from the lockfile (which get complexified on read).
+            // Canonicalize the subset of fork markers that selected this distribution to
+            // match the form persisted in `uv.lock`.
             let fork_markers = if duplicates.contains(dist.name()) {
-                resolution
+                let fork_markers = resolution
                     .fork_markers
                     .iter()
                     .filter(|fork_markers| !fork_markers.is_disjoint(dist.marker))
-                    .map(|marker| {
-                        let simplified =
-                            SimplifiedMarkerTree::new(&requires_python, marker.combined());
-                        UniversalMarker::from_combined(simplified.into_marker(&requires_python))
-                    })
-                    .collect()
+                    .copied()
+                    .collect::<Vec<_>>();
+                canonicalize_universal_markers(&fork_markers, &requires_python)
             } else {
                 vec![]
             };
@@ -465,18 +461,12 @@ impl Lock {
             fork_strategy: resolution.options.fork_strategy,
             exclude_newer: resolution.options.exclude_newer.clone().into(),
         };
-        // Normalize fork markers with a simplify/complexify round-trip through
-        // `requires-python`. This ensures markers from the resolver (which don't include
-        // `requires-python` bounds) match markers deserialized from the lockfile (which get
-        // complexified on read).
-        let fork_markers = resolution
-            .fork_markers
-            .iter()
-            .map(|marker| {
-                let simplified = SimplifiedMarkerTree::new(&requires_python, marker.combined());
-                UniversalMarker::from_combined(simplified.into_marker(&requires_python))
-            })
-            .collect();
+        // Canonicalize the top-level fork markers to match what is persisted in
+        // `uv.lock`. In particular, conflict-only fork markers can serialize to
+        // nothing at the top level, and `uv lock --check` should compare against
+        // that canonical form rather than the raw resolver output.
+        let fork_markers =
+            canonicalize_universal_markers(&resolution.fork_markers, &requires_python);
         let lock = Self::new(
             VERSION,
             REVISION,
@@ -883,6 +873,11 @@ impl Lock {
                 if seen.insert((&package.id, None)) {
                     queue.push_back((package, None));
                 }
+                for extra in &*requirement.extras {
+                    if seen.insert((&package.id, Some(extra))) {
+                        queue.push_back((package, Some(extra)));
+                    }
+                }
             }
         }
 
@@ -900,6 +895,11 @@ impl Lock {
                 {
                     if seen.insert((&package.id, None)) {
                         queue.push_back((package, None));
+                    }
+                    for extra in &*requirement.extras {
+                        if seen.insert((&package.id, Some(extra))) {
+                            queue.push_back((package, Some(extra)));
+                        }
                     }
                 }
             }
@@ -1173,7 +1173,7 @@ impl Lock {
                     let mut package_table = toml_edit::Table::new();
                     for (name, setting) in &exclude_newer.package {
                         match setting {
-                            PackageExcludeNewer::Enabled(exclude_newer_value) => {
+                            ExcludeNewerOverride::Enabled(exclude_newer_value) => {
                                 if let Some(span) = exclude_newer_value.span() {
                                     // Serialize as inline table with timestamp and span
                                     let mut inline = toml_edit::InlineTable::new();
@@ -1191,7 +1191,7 @@ impl Lock {
                                     );
                                 }
                             }
-                            PackageExcludeNewer::Disabled => {
+                            ExcludeNewerOverride::Disabled => {
                                 package_table.insert(name.as_ref(), value(false));
                             }
                         }
@@ -4077,8 +4077,7 @@ impl TryFrom<SourceWire> for Source {
     type Error = LockError;
 
     fn try_from(wire: SourceWire) -> Result<Self, LockError> {
-        #[allow(clippy::enum_glob_use)]
-        use self::SourceWire::*;
+        use self::SourceWire::{Direct, Directory, Editable, Git, Path, Registry, Virtual};
 
         match wire {
             Registry { registry } => Ok(Self::Registry(registry.into())),
@@ -4606,7 +4605,7 @@ impl From<GitSourceKind> for GitReference {
 
 /// Construct the lockfile-compatible [`DisplaySafeUrl`] for a [`GitSourceDist`].
 fn locked_git_url(git_dist: &GitSourceDist) -> DisplaySafeUrl {
-    let mut url = git_dist.git.repository().clone();
+    let mut url = git_dist.git.url().clone();
 
     // Remove the credentials.
     url.remove_credentials();
@@ -5373,7 +5372,7 @@ fn normalize_requirement(
         } => {
             // Reconstruct the Git URL.
             let git = {
-                let mut repository = git.repository().clone();
+                let mut repository = git.url().clone();
 
                 // Remove the credentials.
                 repository.remove_credentials();
@@ -5414,8 +5413,8 @@ fn normalize_requirement(
             ext,
             url: _,
         } => {
-            let install_path =
-                uv_fs::normalize_path_buf(root.join(&install_path)).into_boxed_path();
+            let path = root.join(&install_path);
+            let install_path = normalize_path(path).into_owned().into_boxed_path();
             let url = VerbatimUrl::from_normalized_path(&install_path)
                 .map_err(LockErrorKind::RequirementVerbatimUrl)?;
 
@@ -5438,8 +5437,8 @@ fn normalize_requirement(
             r#virtual,
             url: _,
         } => {
-            let install_path =
-                uv_fs::normalize_path_buf(root.join(&install_path)).into_boxed_path();
+            let path = root.join(&install_path);
+            let install_path = normalize_path(path).into_owned().into_boxed_path();
             let url = VerbatimUrl::from_normalized_path(&install_path)
                 .map_err(LockErrorKind::RequirementVerbatimUrl)?;
 
@@ -6326,6 +6325,36 @@ fn simplified_universal_markers(
     markers: &[UniversalMarker],
     requires_python: &RequiresPython,
 ) -> Vec<String> {
+    canonical_marker_trees(markers, requires_python)
+        .into_iter()
+        .filter_map(MarkerTree::try_to_string)
+        .collect()
+}
+
+/// Canonicalize universal markers to match the form persisted in `uv.lock`.
+///
+/// When the PEP 508 portions of the markers are disjoint, the lockfile stores
+/// only those simplified PEP 508 markers. Otherwise, it stores the simplified
+/// combined markers (including conflict markers). Markers that serialize to
+/// `true` are omitted.
+fn canonicalize_universal_markers(
+    markers: &[UniversalMarker],
+    requires_python: &RequiresPython,
+) -> Vec<UniversalMarker> {
+    canonical_marker_trees(markers, requires_python)
+        .into_iter()
+        .map(|marker| {
+            let simplified = SimplifiedMarkerTree::new(requires_python, marker);
+            UniversalMarker::from_combined(simplified.into_marker(requires_python))
+        })
+        .collect()
+}
+
+/// Return the simplified marker trees that would be persisted in `uv.lock`.
+fn canonical_marker_trees(
+    markers: &[UniversalMarker],
+    requires_python: &RequiresPython,
+) -> Vec<MarkerTree> {
     let mut pep508_only = vec![];
     let mut seen = FxHashSet::default();
     for marker in markers {
@@ -6352,7 +6381,7 @@ fn simplified_universal_markers(
     };
     markers
         .into_iter()
-        .filter_map(MarkerTree::try_to_string)
+        .filter(|marker| !marker.is_true())
         .collect()
 }
 

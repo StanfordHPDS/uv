@@ -1,4 +1,6 @@
+use std::io;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::Result;
@@ -8,20 +10,24 @@ use flate2::write::GzEncoder;
 use fs_err as fs;
 use fs_err::File;
 use indoc::{formatdoc, indoc};
+use insta::assert_snapshot;
 use predicates::prelude::predicate;
 use url::Url;
+use walkdir::WalkDir;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{basic_auth, method, path},
 };
+use zip::write::SimpleFileOptions;
+use zip::{ZipArchive, ZipWriter};
 
-use uv_fs::Simplified;
+use uv_fs::{PortablePath, Simplified};
 use uv_static::EnvVars;
 #[cfg(feature = "test-git")]
 use uv_test::decode_token;
 use uv_test::{
-    DEFAULT_PYTHON_VERSION, TestContext, build_vendor_links_url, download_to_disk, get_bin,
-    packse_index_url, uv_snapshot, venv_bin_path,
+    DEFAULT_PYTHON_VERSION, TestContext, apply_filters, build_vendor_links_url, download_to_disk,
+    get_bin, packse_index_url, uv_snapshot, venv_bin_path,
 };
 
 #[test]
@@ -234,10 +240,85 @@ fn invalid_pyproject_toml_option_unknown_field() -> Result<()> {
         |
       2 | unknown = "field"
         | ^^^^^^^
-      unknown field `unknown`, expected one of `required-version`, `system-certs`, `native-tls`, `offline`, `no-cache`, `cache-dir`, `preview`, `python-preference`, `python-downloads`, `concurrent-downloads`, `concurrent-builds`, `concurrent-installs`, `index`, `index-url`, `extra-index-url`, `no-index`, `find-links`, `index-strategy`, `keyring-provider`, `http-proxy`, `https-proxy`, `no-proxy`, `allow-insecure-host`, `resolution`, `prerelease`, `fork-strategy`, `dependency-metadata`, `config-settings`, `config-settings-package`, `no-build-isolation`, `no-build-isolation-package`, `extra-build-dependencies`, `extra-build-variables`, `exclude-newer`, `exclude-newer-package`, `link-mode`, `compile-bytecode`, `no-sources`, `no-sources-package`, `upgrade`, `upgrade-package`, `reinstall`, `reinstall-package`, `no-build`, `no-build-package`, `no-binary`, `no-binary-package`, `torch-backend`, `python-install-mirror`, `pypy-install-mirror`, `python-downloads-json-url`, `publish-url`, `trusted-publishing`, `check-url`, `add-bounds`, `pip`, `cache-keys`, `override-dependencies`, `exclude-dependencies`, `constraint-dependencies`, `build-constraint-dependencies`, `environments`, `required-environments`, `conflicts`, `workspace`, `sources`, `managed`, `package`, `default-groups`, `dependency-groups`, `dev-dependencies`, `build-backend`
+      unknown field `unknown`, expected one of `required-version`, `system-certs`, `native-tls`, `offline`, `no-cache`, `cache-dir`, `preview`, `python-preference`, `python-downloads`, `concurrent-downloads`, `concurrent-builds`, `concurrent-installs`, `index`, `index-url`, `extra-index-url`, `no-index`, `find-links`, `index-strategy`, `keyring-provider`, `http-proxy`, `https-proxy`, `no-proxy`, `allow-insecure-host`, `resolution`, `prerelease`, `fork-strategy`, `dependency-metadata`, `config-settings`, `config-settings-package`, `no-build-isolation`, `no-build-isolation-package`, `extra-build-dependencies`, `extra-build-variables`, `exclude-newer`, `exclude-newer-package`, `link-mode`, `compile-bytecode`, `no-sources`, `no-sources-package`, `upgrade`, `upgrade-package`, `reinstall`, `reinstall-package`, `no-build`, `no-build-package`, `no-binary`, `no-binary-package`, `torch-backend`, `python-install-mirror`, `pypy-install-mirror`, `python-downloads-json-url`, `publish-url`, `trusted-publishing`, `check-url`, `add-bounds`, `audit`, `pip`, `cache-keys`, `override-dependencies`, `exclude-dependencies`, `constraint-dependencies`, `build-constraint-dependencies`, `environments`, `required-environments`, `conflicts`, `workspace`, `sources`, `managed`, `package`, `default-groups`, `dependency-groups`, `dev-dependencies`, `build-backend`
 
     Resolved in [TIME]
     Checked in [TIME]
+    "#
+    );
+
+    Ok(())
+}
+
+#[test]
+fn pyproject_required_version_preempts_settings_discovery_warning() -> Result<()> {
+    let context =
+        uv_test::test_context!("3.12").with_filter((uv_version::version(), "[UV_VERSION]"));
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(indoc! {r#"
+        [tool.uv]
+        required-version = ">=9999"
+        unknown = "field"
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("iniconfig"), @r#"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: Required uv version `>=9999` does not match the running version `[UV_VERSION]`
+    "#
+    );
+
+    Ok(())
+}
+
+#[test]
+fn uv_toml_required_version_preempts_parse_error() -> Result<()> {
+    let context =
+        uv_test::test_context!("3.12").with_filter((uv_version::version(), "[UV_VERSION]"));
+    let uv_toml = context.temp_dir.child("uv.toml");
+    uv_toml.write_str(indoc! {r#"
+        required-version = ">=9999"
+        unknown = "field"
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("iniconfig"), @r#"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: Required uv version `>=9999` does not match the running version `[UV_VERSION]`
+    "#
+    );
+
+    Ok(())
+}
+
+#[test]
+fn uv_toml_required_version_preempts_pyproject_only_field() -> Result<()> {
+    let context =
+        uv_test::test_context!("3.12").with_filter((uv_version::version(), "[UV_VERSION]"));
+    let uv_toml = context.temp_dir.child("uv.toml");
+    uv_toml.write_str(indoc! {r#"
+        required-version = ">=9999"
+
+        [sources]
+        iniconfig = { git = "https://example.com/iniconfig" }
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("iniconfig"), @r#"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: Required uv version `>=9999` does not match the running version `[UV_VERSION]`
     "#
     );
 
@@ -10010,6 +10091,138 @@ fn static_metadata_source_tree() -> Result<()> {
     Ok(())
 }
 
+/// Regression test for: <https://github.com/astral-sh/uv/issues/18778>
+#[test]
+fn direct_url_hash_source_tree_dependency() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    context.temp_dir.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "pylock"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = [
+          "protobug @ https://files.pythonhosted.org/packages/f2/cc/db26b91cddffbcf0c6df7834fd642578f737fe34197635ae8ea64643a35f/protobug-0.3.0-py3-none-any.whl#sha256=ee81583f376bb38e5e7af425d2453e5e8d4b57bfbf45e5dba1a75329c2026520",
+        ]
+
+        [build-system]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
+    "#})?;
+    context
+        .temp_dir
+        .child("src")
+        .child("pylock")
+        .child("__init__.py")
+        .touch()?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("."), @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+      × Failed to download `protobug @ https://files.pythonhosted.org/packages/f2/cc/db26b91cddffbcf0c6df7834fd642578f737fe34197635ae8ea64643a35f/protobug-0.3.0-py3-none-any.whl#sha256=ee81583f376bb38e5e7af425d2453e5e8d4b57bfbf45e5dba1a75329c2026520`
+      ╰─▶ Hash mismatch for `protobug @ https://files.pythonhosted.org/packages/f2/cc/db26b91cddffbcf0c6df7834fd642578f737fe34197635ae8ea64643a35f/protobug-0.3.0-py3-none-any.whl#sha256=ee81583f376bb38e5e7af425d2453e5e8d4b57bfbf45e5dba1a75329c2026520`
+
+          Expected:
+            sha256:ee81583f376bb38e5e7af425d2453e5e8d4b57bfbf45e5dba1a75329c2026520
+
+          Computed:
+            sha256:ee81583f376bb38e5e7af425d2453e5e8d4b57bfbf45e5dba1a75329c202652e
+      help: `protobug` (v0.3.0) was included because `pylock` (v0.1.0) depends on `protobug`
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn direct_url_hash_source_tree_dependency_conflict() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    context.temp_dir.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "pylock"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = [
+          "anyio @ https://files.pythonhosted.org/packages/36/55/ad4de788d84a630656ece71059665e01ca793c04294c463fd84132f40fe6/anyio-4.0.0-py3-none-any.whl#sha256=cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f",
+          "anyio @ https://files.pythonhosted.org/packages/36/55/ad4de788d84a630656ece71059665e01ca793c04294c463fd84132f40fe6/anyio-4.0.0-py3-none-any.whl#sha256=f7ed51751b2c2add651e5747c891b47e26d2a21be5d32d9311dfe9692f3e5d7a",
+        ]
+
+        [build-system]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
+    "#})?;
+    context
+        .temp_dir
+        .child("src")
+        .child("pylock")
+        .child("__init__.py")
+        .touch()?;
+
+    uv_snapshot!(context.pip_install()
+        .arg("."), @"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: Conflicting archive URL hashes for `anyio @ https://files.pythonhosted.org/packages/36/55/ad4de788d84a630656ece71059665e01ca793c04294c463fd84132f40fe6/anyio-4.0.0-py3-none-any.whl#sha256=f7ed51751b2c2add651e5747c891b47e26d2a21be5d32d9311dfe9692f3e5d7a`: `sha256:cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f` conflicts with `sha256:f7ed51751b2c2add651e5747c891b47e26d2a21be5d32d9311dfe9692f3e5d7a`
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn direct_url_hash_source_tree_dependency_multiple_hash_algorithms() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    context.temp_dir.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "pylock"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = [
+          "anyio @ https://files.pythonhosted.org/packages/36/55/ad4de788d84a630656ece71059665e01ca793c04294c463fd84132f40fe6/anyio-4.0.0-py3-none-any.whl#sha256=cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f",
+          "anyio @ https://files.pythonhosted.org/packages/36/55/ad4de788d84a630656ece71059665e01ca793c04294c463fd84132f40fe6/anyio-4.0.0-py3-none-any.whl#sha512=f30761c1e8725b49c498273b90dba4b05c0fd157811994c806183062cb6647e773364ce45f0e1ff0b10e32fe6d0232ea5ad39476ccf37109d6b49603a09c11c2",
+        ]
+
+        [build-system]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
+    "#})?;
+    context
+        .temp_dir
+        .child("src")
+        .child("pylock")
+        .child("__init__.py")
+        .touch()?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("."), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 4 packages in [TIME]
+    Prepared 4 packages in [TIME]
+    Installed 4 packages in [TIME]
+     + anyio==4.0.0 (from https://files.pythonhosted.org/packages/36/55/ad4de788d84a630656ece71059665e01ca793c04294c463fd84132f40fe6/anyio-4.0.0-py3-none-any.whl#sha512=f30761c1e8725b49c498273b90dba4b05c0fd157811994c806183062cb6647e773364ce45f0e1ff0b10e32fe6d0232ea5ad39476ccf37109d6b49603a09c11c2)
+     + idna==3.6
+     + pylock==0.1.0 (from file://[TEMP_DIR]/)
+     + sniffio==1.3.1
+    "
+    );
+
+    Ok(())
+}
+
 /// Regression test for: <https://github.com/astral-sh/uv/issues/10239#issuecomment-2565663046>
 #[test]
 fn static_metadata_already_installed() -> Result<()> {
@@ -14435,6 +14648,138 @@ fn abi_compatibility_on_freethreaded_python() {
     ");
 }
 
+fn build_debug_wheel(context: &TestContext) -> PathBuf {
+    // Build a wheel with debug ABI tag (cp314d).
+    let package_dir = context.temp_dir.child("cpython_debug_package");
+    package_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+            [project]
+            name = "cpython-debug-package"
+            version = "1.0.0"
+
+            [build-system]
+            requires = ["hatchling"]
+            build-backend = "hatchling.build"
+
+            [tool.hatch.build.hooks.custom]
+        "#})
+        .unwrap();
+    package_dir
+        .child("hatch_build.py")
+        .write_str(indoc! {r#"
+        from hatchling.builders.hooks.plugin.interface import BuildHookInterface
+
+        class CustomBuildHook(BuildHookInterface):
+            def initialize(self, version, build_data):
+                build_data["tag"] = "cp314-cp314d-manylinux_2_17_x86_64"
+                build_data["pure_python"] = False
+    "#})
+        .unwrap();
+    package_dir
+        .child("src/cpython_debug_package/__init__.py")
+        .write_str("# Test package")
+        .unwrap();
+
+    context
+        .build()
+        .arg("--wheel")
+        .current_dir(&package_dir)
+        .assert()
+        .success();
+
+    package_dir.join("dist/cpython_debug_package-1.0.0-cp314-cp314d-manylinux_2_17_x86_64.whl")
+}
+
+/// Since Python 3.8, a debug interpreter accepts both debug (`cp314d`) and non-debug (`cp314`)
+/// wheels.
+#[test]
+#[cfg(feature = "test-python-managed")]
+#[cfg(any(target_os = "macos", target_os = "linux"))] // PBS doesn't have debug builds for windows
+fn abi_compatibility_on_debug_python() {
+    let context = uv_test::test_context_with_versions!(&[])
+        .with_filtered_python_keys()
+        .with_managed_python_dirs()
+        .with_python_download_cache()
+        .with_filtered_python_install_bin()
+        .with_filtered_python_names()
+        .with_filtered_exe_suffix();
+
+    // Install debug CPython 3.14.
+    context
+        .python_install()
+        .arg("--preview")
+        .arg("3.14+debug")
+        .assert()
+        .success();
+
+    // Create a virtual environment with the debug Python.
+    context
+        .venv()
+        .arg("--python")
+        .arg("3.14+debug")
+        .assert()
+        .success();
+
+    // Check that non-debug wheels are supported.
+    let non_debug_wheel = context
+        .workspace_root
+        .join("test/links/cpython_package-1.0.0-cp314-cp314-manylinux_2_17_x86_64.whl");
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--python-platform").arg("linux")
+        .arg(non_debug_wheel), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + cpython-package==1.0.0 (from file://[WORKSPACE]/test/links/cpython_package-1.0.0-cp314-cp314-manylinux_2_17_x86_64.whl)
+    ");
+
+    // Check that debug wheels are supported.
+    let debug_wheel = build_debug_wheel(&context);
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--python-platform").arg("linux")
+        .arg(debug_wheel), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + cpython-debug-package==1.0.0 (from file://[TEMP_DIR]/cpython_debug_package/dist/cpython_debug_package-1.0.0-cp314-cp314d-manylinux_2_17_x86_64.whl)
+    ");
+}
+
+/// Non-debug CPython cannot install wheels tagged `cp314d` — matching pip's behavior where only
+/// the debug interpreter adds the non-debug ABI as a fallback, not vice versa.
+#[test]
+fn abi_compatibility_on_nondebug_python_with_debug_wheel() {
+    let context = uv_test::test_context!("3.14");
+
+    // Check that debug wheels are rejected with a helpful error message.
+    let debug_wheel = build_debug_wheel(&context);
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--python-platform").arg("linux")
+        .arg(debug_wheel), @"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    error: Failed to determine installation plan
+      Caused by: A path dependency is incompatible with the current platform: cpython_debug_package/dist/cpython_debug_package-1.0.0-cp314-cp314d-manylinux_2_17_x86_64.whl
+
+    hint: The wheel is compatible with CPython 3.14 (`cp314d`), but you're using CPython 3.14 (`cp314`)
+    ");
+}
+
 #[test]
 fn warn_on_bz2_wheel() {
     let context = uv_test::test_context!("3.14");
@@ -14632,6 +14977,127 @@ fn install_no_copy_on_write_fs() -> anyhow::Result<()> {
      + iniconfig==2.0.0
     "
     );
+
+    Ok(())
+}
+
+/// `--upgrade-group` is not supported in pip commands.
+#[test]
+fn upgrade_group_not_supported() {
+    let context = uv_test::test_context!("3.12");
+
+    uv_snapshot!(context.pip_install()
+        .arg("anyio")
+        .arg("--upgrade-group")
+        .arg("dev"), @"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: `--upgrade-group` is not supported in `uv pip` commands
+    ");
+}
+
+/// Check that the RECORD in a wheel with that doesn't match its contents gets fixed before
+/// installation.
+#[test]
+fn handle_record_mismatches() -> Result<()> {
+    let context = uv_test::test_context!("3.12")
+        .with_filter((
+            regex::escape(r"foo-0.1.0.dist-info/uv_cache.json,sha256=") + ".*",
+            r"foo-0.1.0.dist-info/uv_cache.json,sha256=[SHA256],[SIZE]",
+        ))
+        .with_filter((
+            regex::escape(r"foo-0.1.0.dist-info/WHEEL,sha256=") + ".*",
+            r"foo-0.1.0.dist-info/WHEEL,sha256=[SHA256],[SIZE]",
+        ));
+
+    // Build a small wheel and unpack it for modification.
+    context.init().arg("--lib").arg("foo").assert().success();
+    context.build().arg("--wheel").arg("foo").assert().success();
+    let built_wheel = context.temp_dir.join("foo/dist/foo-0.1.0-py3-none-any.whl");
+    let unpacked = context.temp_dir.join("foo-unpacked");
+    ZipArchive::new(File::open(built_wheel)?)?.extract(&unpacked)?;
+
+    // Snapshot the current (correct) RECORD.
+    let record = unpacked.join("foo-0.1.0.dist-info/RECORD");
+    let correct_record = fs_err::read_to_string(&record)?;
+    let correct_record = apply_filters(correct_record, context.filters());
+    assert_snapshot!(correct_record, @"
+    foo/__init__.py,sha256=jv2QBpHSNajIRNeADSmtqOWL9QcdUddyMK277kbp06o,49
+    foo/py.typed,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+    foo-0.1.0.dist-info/WHEEL,sha256=[SHA256],[SIZE]
+    foo-0.1.0.dist-info/METADATA,sha256=d-PGjuBKXweF5NgWUW5yDnAjBY0lg4uFZBqcnmGtNgY,147
+    foo-0.1.0.dist-info/RECORD,,
+    ");
+
+    // Create a broken RECORD: Remove 2 files, and add a bogus one.
+    fs_err::write(
+        &record,
+        indoc! {"
+        foo/py.typed,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+        foo-0.1.0.dist-info/WHEEL,sha256=hbX8mDThv1n7VEIpQRy6c2yAFTw4iAQlEC53gDAhHSo,80
+        foo-0.1.0.dist-info/RECORD,,
+        ../../../../etc/passwd,,0
+    "},
+    )?;
+
+    // Repack the wheel.
+    let repacked_wheel = context.temp_dir.join("foo-0.1.0-py3-none-any.whl");
+    let mut writer = ZipWriter::new(File::create(&repacked_wheel)?);
+    let options = SimpleFileOptions::default();
+    for entry in WalkDir::new(&unpacked) {
+        let entry = entry?;
+        let path = entry.path();
+        let name = path.strip_prefix(&unpacked)?;
+        if name.as_os_str().is_empty() {
+            continue;
+        }
+        // Zip entries must use forward slashes, even on Windows.
+        let name = PortablePath::from(name).to_string();
+        if path.is_dir() {
+            writer.add_directory(&name, options)?;
+        } else {
+            writer.start_file(&name, options)?;
+            io::copy(&mut File::open(path)?, &mut writer)?;
+        }
+    }
+    writer.finish()?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--find-links")
+        .arg(context.temp_dir.as_ref())
+        .arg("--offline")
+        .arg("foo"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + foo==0.1.0
+    "
+    );
+
+    // Read the healed RECORD.
+    let installed_record =
+        fs_err::read_to_string(context.site_packages().join("foo-0.1.0.dist-info/RECORD"))?;
+    let snapshot = apply_filters(installed_record, context.filters());
+
+    // Ensure that all expected files are present.
+    assert_snapshot!(&snapshot, @"
+    foo-0.1.0.dist-info/INSTALLER,sha256=5hhM4Q4mYTT9z6QB6PGpUAW81PGNFrYrdXMj4oM_6ak,2
+    foo-0.1.0.dist-info/METADATA,,147
+    foo-0.1.0.dist-info/RECORD,,
+    foo-0.1.0.dist-info/REQUESTED,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+    foo-0.1.0.dist-info/WHEEL,sha256=[SHA256],[SIZE]
+    foo-0.1.0.dist-info/uv_cache.json,sha256=[SHA256],[SIZE]
+    foo/__init__.py,,49
+    foo/py.typed,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+    ");
 
     Ok(())
 }

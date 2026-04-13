@@ -71,6 +71,16 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// timeout on the entire upload.
 pub const DEFAULT_READ_TIMEOUT_UPLOAD: Duration = Duration::from_mins(15);
 
+#[derive(Debug, Error)]
+#[error("failed to build HTTP client")]
+pub struct ClientBuildError(#[source] reqwest::Error);
+
+impl From<reqwest::Error> for ClientBuildError {
+    fn from(error: reqwest::Error) -> Self {
+        Self(error)
+    }
+}
+
 /// Selectively skip parts or the entire auth middleware.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum AuthIntegration {
@@ -380,7 +390,7 @@ impl<'a> BaseClientBuilder<'a> {
         retry_policy(self.retries, self.no_retry_delay)
     }
 
-    pub fn build(&self) -> BaseClient {
+    pub fn build(&self) -> Result<BaseClient, ClientBuildError> {
         if let Some(name) = self.client_name {
             debug!(
                 "Using request connect timeout of {}s and read timeout of {}s for {} client",
@@ -400,7 +410,7 @@ impl<'a> BaseClientBuilder<'a> {
         let (raw_client, raw_dangerous_client) = match &self.custom_client {
             Some(client) => (client.clone(), client.clone()),
             None => {
-                self.create_secure_and_insecure_clients(self.read_timeout, self.connect_timeout)
+                self.create_secure_and_insecure_clients(self.read_timeout, self.connect_timeout)?
             }
         };
 
@@ -416,7 +426,7 @@ impl<'a> BaseClientBuilder<'a> {
             cross_origin_credentials_policy: self.cross_origin_credential_policy,
         };
 
-        BaseClient {
+        Ok(BaseClient {
             connectivity: self.connectivity,
             allow_insecure_host: self.allow_insecure_host.clone(),
             retries: self.retries,
@@ -428,7 +438,7 @@ impl<'a> BaseClientBuilder<'a> {
             read_timeout: self.read_timeout,
             connect_timeout: self.connect_timeout,
             credentials_cache: self.credentials_cache.clone(),
-        }
+        })
     }
 
     /// Share the underlying client between two different middleware configurations.
@@ -464,7 +474,7 @@ impl<'a> BaseClientBuilder<'a> {
         &self,
         read_timeout: Duration,
         connect_timeout: Duration,
-    ) -> (Client, Client) {
+    ) -> Result<(Client, Client), ClientBuildError> {
         // Create user agent.
         let mut user_agent_string = format!("uv/{}", version());
 
@@ -485,7 +495,7 @@ impl<'a> BaseClientBuilder<'a> {
             custom_certs.clone(),
             Security::Secure,
             self.redirect_policy,
-        );
+        )?;
 
         // Create an insecure client that accepts invalid certificates.
         let raw_dangerous_client = self.create_client(
@@ -495,9 +505,9 @@ impl<'a> BaseClientBuilder<'a> {
             custom_certs,
             Security::Insecure,
             self.redirect_policy,
-        );
+        )?;
 
-        (raw_client, raw_dangerous_client)
+        Ok((raw_client, raw_dangerous_client))
     }
 
     fn create_client(
@@ -508,7 +518,7 @@ impl<'a> BaseClientBuilder<'a> {
         custom_certs: Option<Vec<Certificate>>,
         security: Security,
         redirect_policy: RedirectPolicy,
-    ) -> Client {
+    ) -> Result<Client, ClientBuildError> {
         // Configure the builder.
         let client_builder = ClientBuilder::new()
             .http1_title_case_headers()
@@ -574,11 +584,7 @@ impl<'a> BaseClientBuilder<'a> {
             client_builder = client_builder.proxy(proxy);
         }
 
-        let client_builder = client_builder;
-
-        client_builder
-            .build()
-            .expect("Failed to build HTTP client.")
+        client_builder.build().map_err(Into::into)
     }
 
     fn apply_middleware(&self, client: Client) -> ClientWithMiddleware {
