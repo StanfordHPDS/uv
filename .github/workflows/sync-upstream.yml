@@ -5,9 +5,6 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch:
 
-env:
-  GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
-
 permissions:
   contents: write
 
@@ -17,5 +14,5 @@ jobs:
     steps:
       - name: Sync fork
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: gh repo sync StanfordHPDS/uv
