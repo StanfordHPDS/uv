@@ -106,7 +106,7 @@ async-compression = { version = "0.4.12", features = [
 ] }
 async-trait = { version = "0.1.82" }
 async_http_range_reader = { version = "0.11.0", package = "astral_async_http_range_reader" }
-async_zip = { version = "0.0.18-rc3", package = "astral_async_zip", features = [
+async_zip = { version = "0.0.18-rc4", package = "astral_async_zip", features = [
   "bzip2",
   "deflate",
   "lzma",
@@ -133,7 +133,7 @@ configparser = { version = "3.1.0" }
 console = { version = "0.16.0", default-features = false, features = ["std"] }
 csv = { version = "1.3.0" }
 ctrlc = { version = "3.4.5" }
-cyclonedx-bom = { version = "0.8.0" }
+cyclonedx-bom = { version = "0.8.1" }
 dashmap = { version = "6.1.0" }
 data-encoding = { version = "2.6.0" }
 diskus = { version = "0.9.0", default-features = false }
@@ -286,6 +286,7 @@ webpki-root-certs = { version = "1" }
 which = { version = "8.0.0", features = ["regex"] }
 windows = { version = "0.61.0", features = [
   "std",
+  "Win32_Devices_DeviceAndDriverInstallation",
   "Win32_Foundation",
   "Win32_Globalization",
   "Win32_Security",
@@ -305,7 +306,6 @@ windows = { version = "0.61.0", features = [
 windows-registry = { version = "0.5.0" }
 windows-version = { version = "0.1.6" }
 wiremock = { version = "0.6.4" }
-wmi = { version = "0.18.3", default-features = false }
 xz2 = { version = "0.1.7", features = ["static"] }
 zeroize = { version = "1.8.1" }
 
