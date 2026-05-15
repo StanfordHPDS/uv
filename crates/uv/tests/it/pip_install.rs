@@ -11777,6 +11777,218 @@ fn unsupported_git_scheme() {
     );
 }
 
+#[test]
+#[cfg(unix)]
+#[cfg(feature = "test-git")]
+fn install_git_submodule_relative_url() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let temp_dir = &context.temp_dir;
+    let utilities_dir = temp_dir.child("utilities");
+    utilities_dir.create_dir_all()?;
+
+    // Create and initialize the helper repository
+    let helpers_dir = utilities_dir.child("helpers");
+    helpers_dir.create_dir_all()?;
+
+    // Initialize helpers as a git repo
+    Command::new("git")
+        .args(["init"])
+        .current_dir(helpers_dir.path())
+        .output()?;
+
+    // Create a simple file in helpers
+    helpers_dir
+        .child("helper.py")
+        .write_str("def help():\n    return 'I am a helper'")?;
+
+    // Create a nested dependency of the helper repository. This lives outside the parent
+    // repository so the helper must resolve it through its own relative submodule URL.
+    let grandchild_dir = temp_dir.child("grandchild");
+    grandchild_dir.create_dir_all()?;
+
+    Command::new("git")
+        .args(["init"])
+        .current_dir(grandchild_dir.path())
+        .output()?;
+
+    grandchild_dir
+        .child("grandchild.py")
+        .write_str("def help():\n    return 'I am a nested helper'")?;
+
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(grandchild_dir.path())
+        .output()?;
+
+    Command::new("git")
+        .args(["commit", "-m", "Initial nested helpers commit"])
+        .current_dir(grandchild_dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()?;
+
+    Command::new("git")
+        .args(["submodule", "add", "../../grandchild", "nested/grandchild"])
+        .env("GIT_ALLOW_PROTOCOL", "file:ext:http:https:ssh")
+        .current_dir(helpers_dir.path())
+        .assert()
+        .success();
+    helpers_dir
+        .child(".gitmodules")
+        .assert(predicate::path::is_file());
+    helpers_dir
+        .child("nested")
+        .child("grandchild")
+        .child("grandchild.py")
+        .assert(predicate::path::is_file());
+
+    // Add and commit in helpers
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(helpers_dir.path())
+        .output()?;
+
+    Command::new("git")
+        .args(["commit", "-m", "Initial helpers commit"])
+        .current_dir(helpers_dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()?;
+
+    // Create and initialize the main repository
+    let mylib_dir = temp_dir.child("mylib");
+    mylib_dir.create_dir_all()?;
+
+    // Initialize mylib as a git repo
+    Command::new("git")
+        .args(["init"])
+        .current_dir(mylib_dir.path())
+        .output()?;
+
+    // Create a simple setup.py
+    mylib_dir.child("setup.py").write_str(
+        r#"
+from setuptools import setup, find_packages
+
+setup(
+    name="mylib",
+    version="0.1.0",
+    packages=find_packages(),
+)
+"#,
+    )?;
+
+    // Create a simple module file
+    let mylib_package = mylib_dir.child("mylib");
+    mylib_package.create_dir_all()?;
+    mylib_package.child("__init__.py").write_str(
+        r#"
+from .helpers import helper
+
+def main():
+    return f"Hello from mylib, {helper.help()}"
+"#,
+    )?;
+
+    // Set helper as a submodule
+    Command::new("git")
+        .args(["submodule", "add", "../utilities/helpers", "mylib/helpers"])
+        .env("GIT_ALLOW_PROTOCOL", "file:ext:http:https:ssh")
+        .current_dir(mylib_dir.path())
+        .assert()
+        .success();
+    mylib_dir
+        .child(".gitmodules")
+        .assert(predicate::path::is_file());
+    mylib_package
+        .child("helpers")
+        .child("helper.py")
+        .assert(predicate::path::is_file());
+
+    // Add and commit in mylib
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(mylib_dir.path())
+        .output()?;
+
+    Command::new("git")
+        .args(["commit", "-m", "Initial mylib commit with submodule"])
+        .current_dir(mylib_dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()?;
+
+    let mut filters = context.filters();
+    filters.push((r"@[0-9a-f]{40}", "@COMMIT_HASH"));
+
+    uv_snapshot!(filters, context.pip_install()
+        .arg(format!("git+file://{}", mylib_dir.path().display()))
+        // Pass through environment variable to allow file:// URLs in Git subprocesses
+        .env("GIT_ALLOW_PROTOCOL", "file:ext:http:https:ssh"), @r"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + mylib==0.1.0 (from git+file://[TEMP_DIR]/mylib@COMMIT_HASH)
+    ");
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "test-git")]
+fn install_git_submodule_remote() {
+    const TEST_REPO: &str = "astral-test/uv-submodule-pypackage.git";
+    const TEST_REV: &str = "d2c44b87eef25896dd30a6e55d4689b918180c7b";
+    let context = uv_test::test_context!("3.13");
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg(format!("git+https://github.com/{TEST_REPO}@{TEST_REV}")), @r"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-submodule-pypackage.git@d2c44b87eef25896dd30a6e55d4689b918180c7b)
+    ");
+}
+
+/// Like `install_git_submodule_remote` but the submodule URL is relative.
+/// See: <https://github.com/astral-test/uv-submodule-pypackage/commit/377720a1a7f48279bbfc17988454132f13644e84>
+#[test]
+#[cfg(feature = "test-git")]
+fn install_git_submodule_remote_relative() {
+    const TEST_REPO: &str = "astral-test/uv-submodule-pypackage.git";
+    const TEST_REV: &str = "377720a1a7f48279bbfc17988454132f13644e84";
+    let context = uv_test::test_context!("3.13");
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg(format!("git+https://github.com/{TEST_REPO}@{TEST_REV}")), @r"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-submodule-pypackage.git@377720a1a7f48279bbfc17988454132f13644e84)
+    ");
+}
+
 /// Modify a project to use a `src` layout.
 #[test]
 fn change_layout_src() -> Result<()> {
