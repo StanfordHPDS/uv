@@ -11,6 +11,7 @@ pub use source_dist::{build_source_dist, list_source_dist};
 use uv_warnings::warn_user_once;
 pub use wheel::{build_editable, build_wheel, list_wheel, metadata};
 
+use rustc_hash::FxHashSet;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io;
@@ -18,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
 use tracing::debug;
-use walkdir::DirEntry;
 
 use uv_fs::{Simplified, normalize_path};
 use uv_globfilter::PortableGlobError;
@@ -98,16 +98,6 @@ trait DirectoryWriter {
     /// Files added through the method are considered generated when listing included files.
     fn write_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<(), Error>;
 
-    /// Add the file or directory to the path.
-    fn write_dir_entry(&mut self, entry: &DirEntry, target_path: &str) -> Result<(), Error> {
-        if entry.file_type().is_dir() {
-            self.write_directory(target_path)?;
-        } else {
-            self.write_file(target_path, entry.path())?;
-        }
-        Ok(())
-    }
-
     /// Add a local file.
     fn write_file(&mut self, path: &str, file: &Path) -> Result<(), Error>;
 
@@ -116,6 +106,37 @@ trait DirectoryWriter {
 
     /// Write the `RECORD` file and if applicable, the central directory.
     fn close(self, dist_info_dir: &str) -> Result<(), Error>;
+}
+
+fn write_directory_once(
+    writer: &mut impl DirectoryWriter,
+    directories: &mut FxHashSet<PathBuf>,
+    directory: &Path,
+) -> Result<(), Error> {
+    if directories.insert(directory.to_path_buf()) {
+        debug!("Adding directory: {}", directory.user_display());
+        writer.write_directory(&directory.portable_display().to_string())?;
+    }
+    Ok(())
+}
+
+fn write_file_with_directories(
+    writer: &mut impl DirectoryWriter,
+    directories: &mut FxHashSet<PathBuf>,
+    prefix: &Path,
+    relative: &Path,
+    source: &Path,
+) -> Result<(), Error> {
+    if let Some(parent) = relative.parent() {
+        let mut directory = PathBuf::new();
+        for component in parent.components() {
+            directory.push(component);
+            write_directory_once(writer, directories, &prefix.join(&directory))?;
+        }
+    }
+
+    let entry_path = prefix.join(relative).portable_display().to_string();
+    writer.write_file(&entry_path, source)
 }
 
 /// Name of the file in the archive and path outside, if it wasn't generated.
@@ -729,6 +750,15 @@ mod tests {
         fs_err::create_dir_all(module_root.join("__pycache__")).unwrap();
         File::create(module_root.join("__pycache__").join("compiled.pyc")).unwrap();
         File::create(module_root.join("arithmetic").join("circle.pyc")).unwrap();
+        fs_err::create_dir_all(module_root.join("empty")).unwrap();
+        fs_err::create_dir_all(module_root.join("stale").join("__pycache__")).unwrap();
+        File::create(
+            module_root
+                .join("stale")
+                .join("__pycache__")
+                .join("compiled.pyc"),
+        )
+        .unwrap();
 
         // Perform both the direct and the indirect build.
         let dist = TempDir::new().unwrap();
