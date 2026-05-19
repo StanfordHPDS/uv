@@ -88,11 +88,6 @@ pub fn finalize() -> Result<(), PreviewError> {
     }
 }
 
-/// Error returned when [`finalize`] is called on an uninitialized state.
-#[derive(Debug, Error)]
-#[error("The preview configuration has already been finalized")]
-pub struct SetError;
-
 /// Get the current global preview configuration.
 ///
 /// # Panics
@@ -257,6 +252,7 @@ pub enum PreviewFeature {
     ProjectDirectoryMustExist = 1 << 27,
     IndexExcludeNewer = 1 << 28,
     AzureEndpoint = 1 << 29,
+    TomlBackwardsCompatibility = 1 << 30,
 }
 
 impl PreviewFeature {
@@ -293,6 +289,7 @@ impl PreviewFeature {
             Self::ProjectDirectoryMustExist => "project-directory-must-exist",
             Self::IndexExcludeNewer => "index-exclude-newer",
             Self::AzureEndpoint => "azure-endpoint",
+            Self::TomlBackwardsCompatibility => "toml-backwards-compatibility",
         }
     }
 }
@@ -342,6 +339,7 @@ impl FromStr for PreviewFeature {
             "project-directory-must-exist" => Self::ProjectDirectoryMustExist,
             "index-exclude-newer" => Self::IndexExcludeNewer,
             "azure-endpoint" => Self::AzureEndpoint,
+            "toml-backwards-compatibility" => Self::TomlBackwardsCompatibility,
             _ => return Err(PreviewFeatureParseError),
         })
     }
@@ -596,6 +594,10 @@ mod tests {
             "index-exclude-newer"
         );
         assert_eq!(PreviewFeature::AzureEndpoint.as_str(), "azure-endpoint");
+        assert_eq!(
+            PreviewFeature::TomlBackwardsCompatibility.as_str(),
+            "toml-backwards-compatibility"
+        );
     }
 
     #[test]
