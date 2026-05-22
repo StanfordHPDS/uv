@@ -4,9 +4,12 @@ use assert_fs::{fixture::ChildPath, prelude::*};
 use indoc::{formatdoc, indoc};
 use insta::assert_snapshot;
 use predicates::prelude::predicate;
+use serde_json::json;
 use std::process::Command;
 use tempfile::tempdir_in;
 use url::Url;
+use wiremock::matchers::{basic_auth, body_string_contains, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use uv_fs::Simplified;
 use uv_static::EnvVars;
@@ -8042,6 +8045,38 @@ fn no_binary() -> Result<()> {
 }
 
 #[test]
+fn no_binary_package_empty_environment_variable() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["iniconfig"]
+        "#,
+    )?;
+
+    context.lock().assert().success();
+
+    uv_snapshot!(context.filters(), context.sync().env(EnvVars::UV_NO_BINARY_PACKAGE, ""), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + iniconfig==2.0.0
+    ");
+
+    Ok(())
+}
+
+#[test]
 fn no_binary_error() -> Result<()> {
     let context = uv_test::test_context!("3.12");
 
@@ -10894,6 +10929,98 @@ fn sync_git_repeated_member_backwards_path() -> Result<()> {
      + dependency==0.1.0 (from git+https://github.com/astral-sh/uv-backwards-path-test@4bcc7fcd2e548c2ab7ba6b97b1c4e3ababccc7a9#subdirectory=dependency)
      + package==0.1.0 (from git+https://github.com/astral-sh/uv-backwards-path-test@4bcc7fcd2e548c2ab7ba6b97b1c4e3ababccc7a9#subdirectory=root)
     ");
+
+    Ok(())
+}
+
+/// A Git repository that points to a pre-built archive within the repository.
+#[test]
+#[cfg(feature = "test-git")]
+fn sync_git_path_archive() -> Result<()> {
+    let context = uv_test::test_context!("3.13");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "foo"
+        version = "0.1.0"
+        requires-python = ">=3.13"
+        dependencies = ["archive-in-git-test"]
+
+        [tool.uv.sources]
+        archive-in-git-test = { git = "https://github.com/astral-sh/archive-in-git-test.git" }
+        "#,
+    )?;
+
+    uv_snapshot!(context.filters(), context.lock(), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    "###);
+
+    let lock = context.read("uv.lock");
+
+    insta::with_settings!(
+        {
+            filters => context.filters(),
+        },
+        {
+            assert_snapshot!(
+                lock, @r###"
+            version = 1
+            revision = 3
+            requires-python = ">=3.13"
+
+            [options]
+            exclude-newer = "2024-03-25T00:00:00Z"
+
+            [[package]]
+            name = "archive-in-git-test"
+            version = "0.1.0"
+            source = { git = "https://github.com/astral-sh/archive-in-git-test.git#bb7ce6abf9f90544767701de5b7b0c7802dc642b" }
+            dependencies = [
+                { name = "iniconfig" },
+            ]
+
+            [[package]]
+            name = "foo"
+            version = "0.1.0"
+            source = { virtual = "." }
+            dependencies = [
+                { name = "archive-in-git-test" },
+            ]
+
+            [package.metadata]
+            requires-dist = [{ name = "archive-in-git-test", git = "https://github.com/astral-sh/archive-in-git-test.git" }]
+
+            [[package]]
+            name = "iniconfig"
+            version = "2.0.0"
+            source = { git = "https://github.com/astral-sh/archive-in-git-test.git?path=archives%2Finiconfig-2.0.0-py3-none-any.whl#bb7ce6abf9f90544767701de5b7b0c7802dc642b" }
+            wheels = [
+                { filename = "iniconfig-2.0.0-py3-none-any.whl", hash = "sha256:b6a85871a79d2e3b22d2d1b94ac2824226a63c6b741c88f7ae975f18b6778374" },
+            ]
+            "###
+            );
+        }
+    );
+
+    uv_snapshot!(context.filters(), context.sync(), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    Prepared 2 packages in [TIME]
+    Installed 2 packages in [TIME]
+     + archive-in-git-test==0.1.0 (from git+https://github.com/astral-sh/archive-in-git-test.git@bb7ce6abf9f90544767701de5b7b0c7802dc642b)
+     + iniconfig==2.0.0 (from git+https://github.com/astral-sh/archive-in-git-test.git@bb7ce6abf9f90544767701de5b7b0c7802dc642b#path=archives/iniconfig-2.0.0-py3-none-any.whl)
+    "###);
 
     Ok(())
 }
@@ -15040,7 +15167,7 @@ fn sync_git_lfs() -> Result<()> {
     Prepared 1 package in [TIME]
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
-     - test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo.git@261c828b8e05251f3a3e4f6b47b149d691c7efbb#lfs=true)
+     - test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo@261c828b8e05251f3a3e4f6b47b149d691c7efbb#lfs=true)
      + test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo.git@261c828b8e05251f3a3e4f6b47b149d691c7efbb)
     ");
 
@@ -15149,7 +15276,7 @@ fn sync_git_lfs() -> Result<()> {
     Prepared 1 package in [TIME]
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
-     - test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo.git@261c828b8e05251f3a3e4f6b47b149d691c7efbb)
+     - test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo@261c828b8e05251f3a3e4f6b47b149d691c7efbb)
      + test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo.git@261c828b8e05251f3a3e4f6b47b149d691c7efbb#lfs=true)
     ");
 
@@ -15176,7 +15303,7 @@ fn sync_git_lfs() -> Result<()> {
     Prepared 1 package in [TIME]
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
-     - test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo.git@261c828b8e05251f3a3e4f6b47b149d691c7efbb#lfs=true)
+     - test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo@261c828b8e05251f3a3e4f6b47b149d691c7efbb#lfs=true)
      + test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo.git@261c828b8e05251f3a3e4f6b47b149d691c7efbb)
     ");
 
@@ -15208,7 +15335,7 @@ fn sync_git_lfs() -> Result<()> {
     Prepared 1 package in [TIME]
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
-     - test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo.git@261c828b8e05251f3a3e4f6b47b149d691c7efbb)
+     - test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo@261c828b8e05251f3a3e4f6b47b149d691c7efbb)
      + test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo.git@261c828b8e05251f3a3e4f6b47b149d691c7efbb#lfs=true)
     ");
 
@@ -15234,7 +15361,7 @@ fn sync_git_lfs() -> Result<()> {
     Prepared 1 package in [TIME]
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
-     - test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo.git@261c828b8e05251f3a3e4f6b47b149d691c7efbb#lfs=true)
+     - test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo@261c828b8e05251f3a3e4f6b47b149d691c7efbb#lfs=true)
      + test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo.git@261c828b8e05251f3a3e4f6b47b149d691c7efbb)
     ");
 
@@ -15298,7 +15425,7 @@ fn sync_git_lfs() -> Result<()> {
     Prepared 1 package in [TIME]
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
-     - test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo.git@261c828b8e05251f3a3e4f6b47b149d691c7efbb)
+     - test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo@261c828b8e05251f3a3e4f6b47b149d691c7efbb)
      + test-lfs-repo==0.1.0 (from git+https://github.com/astral-sh/test-lfs-repo.git@261c828b8e05251f3a3e4f6b47b149d691c7efbb#lfs=true)
     ");
 
@@ -16497,6 +16624,427 @@ fn sync_reinstalls_on_version_change() -> Result<()> {
     ");
 
     Ok(())
+}
+
+/// Ensure that `uv sync` aborts when malware is detected in a dependency.
+#[tokio::test]
+async fn sync_malware_detected() {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["iniconfig==2.0.0"]
+    "#})
+        .unwrap();
+
+    context.lock().assert().success();
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{"vulns": [{"id": "MAL-2026-1234"}]}]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/vulns/MAL-2026-1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "MAL-2026-1234",
+            "modified": "2026-01-01T00:00:00Z",
+        })))
+        .mount(&server)
+        .await;
+
+    uv_snapshot!(context.filters(), context
+        .sync()
+        .arg("--preview-features").arg("malware-check")
+        .env(EnvVars::UV_MALWARE_CHECK, "1")
+        .env(EnvVars::UV_MALWARE_CHECK_URL, server.uri()), @"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    warning: Malware detected in locked dependencies:
+      - `iniconfig==2.0.0`: MAL-2026-1234 (https://osv.dev/vulnerability/MAL-2026-1234)
+    error: Malware detected in one or more dependencies that would be installed; aborting sync. Set `UV_MALWARE_CHECK=0` to bypass this check.
+    ");
+}
+
+/// Ensure that `uv sync` succeeds when no malware is found.
+#[tokio::test]
+async fn sync_malware_check_clean() {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["iniconfig==2.0.0"]
+    "#})
+        .unwrap();
+
+    context.lock().assert().success();
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{"vulns": []}]
+        })))
+        .mount(&server)
+        .await;
+
+    uv_snapshot!(context.filters(), context
+        .sync()
+        .arg("--preview-features").arg("malware-check")
+        .env(EnvVars::UV_MALWARE_CHECK, "1")
+        .env(EnvVars::UV_MALWARE_CHECK_URL, server.uri()), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + iniconfig==2.0.0
+    ");
+}
+
+/// Ensure that malware checks can authenticate through the configured keyring provider.
+#[tokio::test]
+async fn sync_malware_check_keyring_auth() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    // Install our keyring plugin.
+    context
+        .pip_install()
+        .arg(
+            context
+                .workspace_root
+                .join("test")
+                .join("packages")
+                .join("keyring_test_plugin"),
+        )
+        .assert()
+        .success();
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["iniconfig==2.0.0"]
+    "#})?;
+
+    context
+        .lock()
+        .env(EnvVars::UV_DEFAULT_INDEX, "https://pypi.org/simple")
+        .assert()
+        .success();
+
+    let server = MockServer::start().await;
+    let mut malware_check_url = Url::parse(&server.uri())?;
+    malware_check_url
+        .set_username("public")
+        .map_err(|()| anyhow!("failed to set malware check URL username"))?;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .and(basic_auth("public", "heron"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{"vulns": [{"id": "MAL-2026-1234"}]}]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/vulns/MAL-2026-1234"))
+        .and(basic_auth("public", "heron"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "MAL-2026-1234",
+            "modified": "2026-01-01T00:00:00Z",
+        })))
+        .mount(&server)
+        .await;
+
+    uv_snapshot!(context.filters(), context
+        .sync()
+        .arg("--preview-features").arg("malware-check")
+        .arg("--keyring-provider").arg("subprocess")
+        .env(EnvVars::UV_MALWARE_CHECK, "1")
+        .env(EnvVars::UV_MALWARE_CHECK_URL, malware_check_url.as_str())
+        .env(EnvVars::UV_DEFAULT_INDEX, "https://pypi.org/simple")
+        .env(
+            EnvVars::KEYRING_TEST_CREDENTIALS,
+            format!(
+                r#"{{"{}/v1/querybatch": {{"public": "heron"}}}}"#,
+                server.uri()
+            )
+        )
+        .env(EnvVars::PATH, venv_bin_path(&context.venv)), @"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Keyring request for public@http://[LOCALHOST]/v1/querybatch
+    warning: Malware detected in locked dependencies:
+      - `iniconfig==2.0.0`: MAL-2026-1234 (https://osv.dev/vulnerability/MAL-2026-1234)
+    error: Malware detected in one or more dependencies that would be installed; aborting sync. Set `UV_MALWARE_CHECK=0` to bypass this check.
+    ");
+
+    Ok(())
+}
+
+/// Ensure that the malware check only reports `MAL-` prefixed IDs and skips others.
+#[tokio::test]
+async fn sync_malware_check_skips_non_mal() {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["iniconfig==2.0.0"]
+    "#})
+        .unwrap();
+
+    context.lock().assert().success();
+
+    let server = MockServer::start().await;
+
+    // Return both a MAL- and a non-MAL vulnerability.
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{"vulns": [
+                {"id": "MAL-2026-5678"},
+                {"id": "GHSA-xxxx-yyyy"}
+            ]}]
+        })))
+        .mount(&server)
+        .await;
+
+    // Only the MAL- vuln should be fetched.
+    Mock::given(method("GET"))
+        .and(path("/v1/vulns/MAL-2026-5678"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "MAL-2026-5678",
+            "modified": "2026-01-01T00:00:00Z",
+        })))
+        .mount(&server)
+        .await;
+
+    // The error should only mention the MAL- advisory.
+    uv_snapshot!(context.filters(), context
+        .sync()
+        .arg("--preview-features").arg("malware-check")
+        .env(EnvVars::UV_MALWARE_CHECK, "1")
+        .env(EnvVars::UV_MALWARE_CHECK_URL, server.uri()), @"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    warning: Malware detected in locked dependencies:
+      - `iniconfig==2.0.0`: MAL-2026-5678 (https://osv.dev/vulnerability/MAL-2026-5678)
+    error: Malware detected in one or more dependencies that would be installed; aborting sync. Set `UV_MALWARE_CHECK=0` to bypass this check.
+    ");
+}
+
+/// Ensure that `UV_MALWARE_CHECK=0` keeps the malware check disabled even when the preview
+/// feature is enabled.
+#[tokio::test]
+async fn sync_malware_check_disabled() {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["iniconfig==2.0.0"]
+    "#})
+        .unwrap();
+
+    context.lock().assert().success();
+
+    let server = MockServer::start().await;
+
+    // Even though the preview feature is enabled, the check is explicitly disabled via env
+    // var so no request should be made. (No mocks are mounted, so any request would fail.)
+
+    uv_snapshot!(context.filters(), context
+        .sync()
+        .arg("--preview-features").arg("malware-check")
+        .env(EnvVars::UV_MALWARE_CHECK, "0")
+        .env(EnvVars::UV_MALWARE_CHECK_URL, server.uri()), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + iniconfig==2.0.0
+    ");
+}
+
+/// Ensure that a network error during the malware check fails the sync.
+#[tokio::test]
+async fn sync_malware_check_network_error() {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["iniconfig==2.0.0"]
+    "#})
+        .unwrap();
+
+    context.lock().assert().success();
+
+    let server = MockServer::start().await;
+
+    // Return a 500 error to simulate a service failure.
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    uv_snapshot!(context.filters(), context
+        .sync()
+        .arg("--preview-features").arg("malware-check")
+        .env(EnvVars::UV_MALWARE_CHECK, "1")
+        .env(EnvVars::UV_MALWARE_CHECK_URL, server.uri())
+        .env(EnvVars::UV_TEST_NO_HTTP_RETRY_DELAY, "true"), @"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    error: Malware check failed due to an error from OSV
+      Caused by: HTTP status server error (500 Internal Server Error) for url (http://[LOCALHOST]/v1/querybatch)
+    ");
+}
+
+/// Ensure that a malformed `UV_MALWARE_CHECK_URL` produces a clear error.
+#[tokio::test]
+async fn sync_malware_check_url_invalid() {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["iniconfig==2.0.0"]
+    "#})
+        .unwrap();
+
+    uv_snapshot!(context.filters(), context
+        .sync()
+        .env(EnvVars::UV_MALWARE_CHECK_URL, "not-a-url"), @"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: Failed to parse environment variable `UV_MALWARE_CHECK_URL` with invalid value `not-a-url`: relative URL without a base
+    ");
+}
+
+/// Test that malware checks query all extras and groups, but only fail for the installed set.
+#[tokio::test]
+async fn sync_malware_check_skips_inactive_extras_and_groups() {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["iniconfig==2.0.0"]
+
+        [project.optional-dependencies]
+        plus = ["typing-extensions==4.10.0"]
+
+        [dependency-groups]
+        lint = ["sortedcontainers==2.4.0"]
+    "#})
+        .unwrap();
+
+    context.lock().assert().success();
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .and(body_string_contains("iniconfig"))
+        .and(body_string_contains("typing-extensions"))
+        .and(body_string_contains("sortedcontainers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                {"vulns": []},
+                {"vulns": [{"id": "MAL-INACTIVE-GROUP"}]},
+                {"vulns": [{"id": "MAL-INACTIVE-EXTRA"}]}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    uv_snapshot!(context.filters(), context
+        .sync()
+        .arg("--preview-features").arg("malware-check")
+        .env(EnvVars::UV_MALWARE_CHECK, "1")
+        .env(EnvVars::UV_MALWARE_CHECK_URL, server.uri()), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 4 packages in [TIME]
+    warning: Malware detected in locked dependencies:
+      - `sortedcontainers==2.4.0`: MAL-INACTIVE-GROUP (https://osv.dev/vulnerability/MAL-INACTIVE-GROUP)
+      - `typing-extensions==4.10.0`: MAL-INACTIVE-EXTRA (https://osv.dev/vulnerability/MAL-INACTIVE-EXTRA)
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + iniconfig==2.0.0
+    ");
 }
 
 /// Regression test for #19419: `uv sync --frozen` must honor credentials

@@ -3653,7 +3653,8 @@ fn resolve_system_configuration_can_be_disabled() -> anyhow::Result<()> {
     uv_snapshot!(context.filters(), add_shared_args(context.pip_compile())
         .arg("--show-settings")
         .arg("requirements.in")
-        .env(EnvVars::XDG_CONFIG_DIRS, xdg.path()), @r#"
+        .env(EnvVars::XDG_CONFIG_DIRS, xdg.path())
+        .env_remove(EnvVars::UV_NO_SYSTEM_CONFIG), @r#"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -8636,6 +8637,7 @@ fn preview_features() {
                 IndexExcludeNewer,
                 AzureEndpoint,
                 TomlBackwardsCompatibility,
+                MalwareCheck,
             ],
         },
         python_preference: Managed,
@@ -8722,6 +8724,10 @@ fn preview_features() {
             },
             compile_bytecode: false,
             reinstall: None,
+        },
+        malware_settings: MalwareCheckSettings {
+            enabled: false,
+            malware_check_url: None,
         },
     }
 
@@ -8844,6 +8850,10 @@ fn preview_features() {
             compile_bytecode: false,
             reinstall: None,
         },
+        malware_settings: MalwareCheckSettings {
+            enabled: false,
+            malware_check_url: None,
+        },
     }
 
     ----- stderr -----
@@ -8910,6 +8920,7 @@ fn preview_features() {
                 IndexExcludeNewer,
                 AzureEndpoint,
                 TomlBackwardsCompatibility,
+                MalwareCheck,
             ],
         },
         python_preference: Managed,
@@ -8996,6 +9007,10 @@ fn preview_features() {
             },
             compile_bytecode: false,
             reinstall: None,
+        },
+        malware_settings: MalwareCheckSettings {
+            enabled: false,
+            malware_check_url: None,
         },
     }
 
@@ -9121,6 +9136,10 @@ fn preview_features() {
             compile_bytecode: false,
             reinstall: None,
         },
+        malware_settings: MalwareCheckSettings {
+            enabled: false,
+            malware_check_url: None,
+        },
     }
 
     ----- stderr -----
@@ -9245,6 +9264,10 @@ fn preview_features() {
             compile_bytecode: false,
             reinstall: None,
         },
+        malware_settings: MalwareCheckSettings {
+            enabled: false,
+            malware_check_url: None,
+        },
     }
 
     ----- stderr -----
@@ -9367,6 +9390,10 @@ fn preview_features() {
             },
             compile_bytecode: false,
             reinstall: None,
+        },
+        malware_settings: MalwareCheckSettings {
+            enabled: false,
+            malware_check_url: None,
         },
     }
 
@@ -9501,6 +9528,10 @@ fn system_certs_cli_aliases_override_env() {
             compile_bytecode: false,
             reinstall: None,
         },
+        malware_settings: MalwareCheckSettings {
+            enabled: false,
+            malware_check_url: None,
+        },
     }
 
     ----- stderr -----
@@ -9625,6 +9656,10 @@ fn system_certs_cli_aliases_override_env() {
             },
             compile_bytecode: false,
             reinstall: None,
+        },
+        malware_settings: MalwareCheckSettings {
+            enabled: false,
+            malware_check_url: None,
         },
     }
 
@@ -9761,6 +9796,10 @@ fn system_certs_config_aliases() -> anyhow::Result<()> {
             compile_bytecode: false,
             reinstall: None,
         },
+        malware_settings: MalwareCheckSettings {
+            enabled: false,
+            malware_check_url: None,
+        },
     }
 
     ----- stderr -----
@@ -9887,6 +9926,10 @@ fn system_certs_config_aliases() -> anyhow::Result<()> {
             },
             compile_bytecode: false,
             reinstall: None,
+        },
+        malware_settings: MalwareCheckSettings {
+            enabled: false,
+            malware_check_url: None,
         },
     }
 

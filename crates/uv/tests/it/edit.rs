@@ -13,6 +13,7 @@ use assert_cmd::assert::OutputAssertExt;
 use assert_fs::prelude::*;
 use indoc::{formatdoc, indoc};
 use insta::assert_snapshot;
+use serde_json::json;
 use std::path::Path;
 use url::Url;
 use wiremock::{
@@ -3966,7 +3967,7 @@ fn add_update_git_reference_project() -> Result<()> {
     Prepared 1 package in [TIME]
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
-     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389)
+     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389)
      + uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@0dacfd662c64cb4ceb16e6cf65a157a8b715b979)
     ");
 
@@ -3979,7 +3980,7 @@ fn add_update_git_reference_project() -> Result<()> {
     Resolved 2 packages in [TIME]
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
-     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@0dacfd662c64cb4ceb16e6cf65a157a8b715b979)
+     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage@0dacfd662c64cb4ceb16e6cf65a157a8b715b979)
      + uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389)
     ");
 
@@ -3993,7 +3994,7 @@ fn add_update_git_reference_project() -> Result<()> {
     Prepared 1 package in [TIME]
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
-     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389)
+     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389)
      + uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@2005223fcad0e2c06daf2e14b93b790604868e1e)
     ");
 
@@ -15413,4 +15414,57 @@ fn add_git_lfs_error() -> Result<()> {
     ");
 
     Ok(())
+}
+
+/// Ensure that `uv add` aborts when malware is detected in a dependency.
+#[tokio::test]
+async fn add_malware_detected() {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = []
+    "#})
+        .unwrap();
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{"vulns": [{"id": "MAL-2026-1234"}]}]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/vulns/MAL-2026-1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "MAL-2026-1234",
+            "modified": "2026-01-01T00:00:00Z",
+        })))
+        .mount(&server)
+        .await;
+
+    uv_snapshot!(context.filters(), context
+        .add()
+        .arg("iniconfig==2.0.0")
+        .arg("--preview-features").arg("malware-check")
+        .env(EnvVars::UV_MALWARE_CHECK, "1")
+        .env(EnvVars::UV_MALWARE_CHECK_URL, server.uri()), @"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    warning: Malware detected in locked dependencies:
+      - `iniconfig==2.0.0`: MAL-2026-1234 (https://osv.dev/vulnerability/MAL-2026-1234)
+    error: Malware detected in one or more dependencies that would be installed; aborting sync. Set `UV_MALWARE_CHECK=0` to bypass this check.
+    ");
 }
