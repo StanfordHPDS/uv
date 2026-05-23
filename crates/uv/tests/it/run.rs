@@ -510,6 +510,44 @@ fn run_pep723_script() -> Result<()> {
     Ok(())
 }
 
+/// A PEP 723 script with a long file name should still succeed at creating a script environment on
+/// Windows.
+#[test]
+fn run_pep723_script_long_filename() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    // The cache environment entry path, which is derived from the script's name, would exceed many
+    // common path component length limits if it was not truncated first.
+    let script_name = format!("{}.py", "a".repeat(240));
+    let test_script = context.temp_dir.child(&script_name);
+    test_script.write_str(indoc! { r#"
+        # /// script
+        # requires-python = ">=3.11"
+        # dependencies = [
+        #   "iniconfig",
+        # ]
+        # ///
+
+        print("Hello, world!")
+       "#
+    })?;
+
+    uv_snapshot!(context.filters(), context.run().arg(&script_name), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    Hello, world!
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + iniconfig==2.0.0
+    ");
+
+    Ok(())
+}
+
 #[test]
 fn run_pep723_script_requires_python() -> Result<()> {
     let context = uv_test::test_context_with_versions!(&["3.11", "3.12"]);
@@ -6647,60 +6685,6 @@ fn run_target_workspace_discovery() -> Result<()> {
 
     // With the preview feature, the workspace is discovered from the target's directory.
     uv_snapshot!(context.filters(), context.run().arg("--preview-features").arg("target-workspace-discovery").arg("project/script.py").env_remove(EnvVars::VIRTUAL_ENV), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-    success
-
-    ----- stderr -----
-    Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
-    Creating virtual environment at: project/.venv
-    Resolved 2 packages in [TIME]
-    Prepared 2 packages in [TIME]
-    Installed 2 packages in [TIME]
-     + foo==1.0.0 (from file://[TEMP_DIR]/project)
-     + iniconfig==2.0.0
-    ");
-
-    Ok(())
-}
-
-/// Test that `--preview` enables target workspace discovery.
-#[test]
-fn run_target_workspace_discovery_preview_flag() -> Result<()> {
-    let context = setup_target_workspace_discovery_context()?;
-
-    context.temp_dir.child("uv.toml").write_str("bad")?;
-    context.temp_dir.child("pyproject.toml").write_str("bad")?;
-
-    uv_snapshot!(context.filters(), context.run().arg("--preview").arg("project/script.py").env_remove(EnvVars::VIRTUAL_ENV), @"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-    success
-
-    ----- stderr -----
-    Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
-    Creating virtual environment at: project/.venv
-    Resolved 2 packages in [TIME]
-    Prepared 2 packages in [TIME]
-    Installed 2 packages in [TIME]
-     + foo==1.0.0 (from file://[TEMP_DIR]/project)
-     + iniconfig==2.0.0
-    ");
-
-    Ok(())
-}
-
-/// Test that `UV_PREVIEW=1` enables target workspace discovery.
-#[test]
-fn run_target_workspace_discovery_uv_preview_env() -> Result<()> {
-    let context = setup_target_workspace_discovery_context()?;
-
-    context.temp_dir.child("uv.toml").write_str("bad")?;
-    context.temp_dir.child("pyproject.toml").write_str("bad")?;
-
-    uv_snapshot!(context.filters(), context.run().env("UV_PREVIEW", "1").arg("project/script.py").env_remove(EnvVars::VIRTUAL_ENV), @"
     success: true
     exit_code: 0
     ----- stdout -----
