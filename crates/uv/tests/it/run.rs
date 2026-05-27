@@ -507,6 +507,30 @@ fn run_pep723_script() -> Result<()> {
     error: An opening tag (`# /// script`) was found without a closing tag (`# ///`). Ensure that every line between the opening and closing tags (including empty lines) starts with a leading `#`.
     ");
 
+    // Regression test for: <https://github.com/astral-sh/uv/issues/18617>
+    let test_script = context.temp_dir.child("main.py");
+    test_script.write_str(indoc! { r#"
+        # /// script
+        # dependencies = []
+        # ///
+
+        print("Hello, world!")
+
+        # /// script
+        # dependencies = []
+        # ///
+       "#
+    })?;
+
+    uv_snapshot!(context.filters(), context.run().arg("--no-project").arg("main.py"), @"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: The script contains multiple PEP 723 metadata blocks
+    ");
+
     Ok(())
 }
 
@@ -5071,6 +5095,35 @@ fn run_with_env_file() -> Result<()> {
     })?;
 
     uv_snapshot!(context.filters(), context.run().arg("--env-file").arg(".file").arg("test.py"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    palpatine
+    leia_organa
+    obi_wan_kenobi
+    C3PO
+
+    ----- stderr -----
+    ");
+
+    context.temp_dir.child(".file").write_str(indoc! { "
+        UV_PYTHON_SEARCH_PATH=.no-python
+        THE_EMPIRE_VARIABLE=palpatine
+        REBEL_1=leia_organa
+        REBEL_2=obi_wan_kenobi
+        REBEL_3=C3PO
+       "
+    })?;
+
+    uv_snapshot!(context.filters(), context.run()
+        .arg("--no-project")
+        .arg("--no-managed-python")
+        .arg("--python").arg("3.12")
+        .arg("--env-file").arg(".file")
+        .arg("test.py")
+        .env_remove(EnvVars::VIRTUAL_ENV)
+        .env_remove(EnvVars::UV_PYTHON_SEARCH_PATH)
+        .env(EnvVars::PATH, context.python_path()), @"
     success: true
     exit_code: 0
     ----- stdout -----
