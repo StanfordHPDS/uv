@@ -1283,6 +1283,13 @@ async fn run(cli: Cli) -> Result<ExitStatus> {
                 args.allow_existing,
                 args.clear,
                 args.no_clear,
+                if args.force {
+                    uv_virtualenv::ClearNonVirtualenv::Allow
+                } else if globals.preview.is_enabled(PreviewFeature::VenvSafeClear) {
+                    uv_virtualenv::ClearNonVirtualenv::Error
+                } else {
+                    uv_virtualenv::ClearNonVirtualenv::Warn
+                },
             );
 
             Box::pin(commands::venv(
@@ -1953,8 +1960,10 @@ async fn run(cli: Cli) -> Result<ExitStatus> {
                     args.frozen,
                     args.dry_run,
                     args.refresh,
+                    args.sync,
                     args.python,
                     args.install_mirrors,
+                    args.malware_settings,
                     args.settings,
                     client_builder.subcommand(vec!["workspace".to_owned(), "metadata".to_owned()]),
                     globals.python_preference,

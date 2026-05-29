@@ -3967,7 +3967,7 @@ fn add_update_git_reference_project() -> Result<()> {
     Prepared 1 package in [TIME]
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
-     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389)
+     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389)
      + uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@0dacfd662c64cb4ceb16e6cf65a157a8b715b979)
     ");
 
@@ -3980,7 +3980,7 @@ fn add_update_git_reference_project() -> Result<()> {
     Resolved 2 packages in [TIME]
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
-     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage@0dacfd662c64cb4ceb16e6cf65a157a8b715b979)
+     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@0dacfd662c64cb4ceb16e6cf65a157a8b715b979)
      + uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389)
     ");
 
@@ -3994,7 +3994,7 @@ fn add_update_git_reference_project() -> Result<()> {
     Prepared 1 package in [TIME]
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
-     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389)
+     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389)
      + uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@2005223fcad0e2c06daf2e14b93b790604868e1e)
     ");
 
@@ -4686,6 +4686,65 @@ fn add_error() -> Result<()> {
 
     let lock = context.temp_dir.join("uv.lock");
     assert!(!lock.exists());
+
+    Ok(())
+}
+
+/// Suggest avoiding dependencies for modules in the Python standard library.
+#[test]
+fn add_standard_library_error() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = []
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.add().arg("pickle"), @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+
+    ----- stderr -----
+      × No solution found when resolving dependencies:
+      ╰─▶ Because pickle was not found in the package registry and your project depends on pickle, we can conclude that your project's requirements are unsatisfiable.
+
+    hint: The module `pickle` is included in the Python standard library and usually should not be added as a dependency
+    hint: If you want to add the package regardless of the failed resolution, provide the `--frozen` flag to skip locking and syncing
+    ");
+
+    Ok(())
+}
+
+/// Avoid suggesting a standard-library alternative for unrelated resolution failures.
+#[test]
+fn add_standard_library_unrelated_resolution_error() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = []
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.add().arg("typing").arg("xyz"), @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+
+    ----- stderr -----
+      × No solution found when resolving dependencies:
+      ╰─▶ Because there are no versions of xyz and your project depends on xyz, we can conclude that your project's requirements are unsatisfiable.
+
+    hint: If you want to add the package regardless of the failed resolution, provide the `--frozen` flag to skip locking and syncing
+    ");
 
     Ok(())
 }

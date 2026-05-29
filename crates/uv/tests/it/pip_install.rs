@@ -1652,6 +1652,36 @@ fn install_no_editable() {
 }
 
 #[test]
+fn install_no_editable_package() {
+    let context = uv_test::test_context!("3.12");
+    let executable_file = context.workspace_root.join("test/packages/executable_file");
+    let black = context.workspace_root.join("test/packages/black_editable");
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("-e")
+        .arg(&executable_file)
+        .arg("-e")
+        .arg(&black)
+        .arg("--no-editable-package")
+        .arg("executable-file"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Prepared 2 packages in [TIME]
+    Installed 2 packages in [TIME]
+     + black==0.1.0 (from file://[WORKSPACE]/test/packages/black_editable)
+     + executable-file==1.0.0 (from file://[WORKSPACE]/test/packages/executable_file)
+    "
+    );
+
+    assert!(context.site_packages().join("black.pth").is_file());
+    assert!(!context.site_packages().join("executable_file.pth").exists());
+}
+
+#[test]
 fn install_no_editable_requirements_txt() -> Result<()> {
     let context = uv_test::test_context!("3.12");
     let package = context.workspace_root.join("test/packages/executable_file");
@@ -10618,11 +10648,11 @@ fn cyclic_build_dependency() {
 
 #[test]
 #[cfg(feature = "test-git")]
-fn direct_url_json_git_default() -> Result<()> {
+fn direct_url_json_git_preserves_repository_url() -> Result<()> {
     let context = uv_test::test_context!("3.12");
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str(
-        "uv-public-pypackage @ git+https://github.com/astral-test/uv-public-pypackage",
+        "uv-public-pypackage @ git+https://github.com/astral-test/uv-public-pypackage.git",
     )?;
 
     uv_snapshot!(context.pip_install()
@@ -10637,7 +10667,7 @@ fn direct_url_json_git_default() -> Result<()> {
     Resolved 1 package in [TIME]
     Prepared 1 package in [TIME]
     Installed 1 package in [TIME]
-     + uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389)
+     + uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage.git@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389)
     "
     );
 
@@ -10649,7 +10679,7 @@ fn direct_url_json_git_default() -> Result<()> {
     direct_url.assert(predicates::path::is_file());
 
     let direct_url_content = fs_err::read_to_string(direct_url.path())?;
-    insta::assert_snapshot!(direct_url_content, @r#"{"url":"https://github.com/astral-test/uv-public-pypackage","vcs_info":{"vcs":"git","commit_id":"b270df1a2fb5d012294e9aaf05e7e0bab1e6a389"}}"#);
+    insta::assert_snapshot!(direct_url_content, @r#"{"url":"https://github.com/astral-test/uv-public-pypackage.git","vcs_info":{"vcs":"git","commit_id":"b270df1a2fb5d012294e9aaf05e7e0bab1e6a389"}}"#);
 
     Ok(())
 }
