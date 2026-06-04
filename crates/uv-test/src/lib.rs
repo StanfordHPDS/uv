@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::str::FromStr;
 use std::{env, io};
-use uv_preview::Preview;
 use uv_python::downloads::ManagedPythonDownloadList;
 
 use assert_cmd::assert::{Assert, OutputAssertExt};
@@ -44,12 +43,12 @@ static TEST_TIMESTAMP: &str = "2024-03-25T00:00:00Z";
 pub const DEFAULT_PYTHON_VERSION: &str = "3.12";
 
 // The expected latest patch version for each Python minor version.
-pub const LATEST_PYTHON_3_15: &str = "3.15.0b1";
-pub const LATEST_PYTHON_3_14: &str = "3.14.5";
-pub const LATEST_PYTHON_3_13: &str = "3.13.13";
+const LATEST_PYTHON_3_15: &str = "3.15.0b2";
+const LATEST_PYTHON_3_14: &str = "3.14.5";
+const LATEST_PYTHON_3_13: &str = "3.13.13";
 pub const LATEST_PYTHON_3_12: &str = "3.12.13";
-pub const LATEST_PYTHON_3_11: &str = "3.11.15";
-pub const LATEST_PYTHON_3_10: &str = "3.10.20";
+const LATEST_PYTHON_3_11: &str = "3.11.15";
+const LATEST_PYTHON_3_10: &str = "3.10.20";
 
 /// Create a new [`TestContext`] with the given Python version.
 ///
@@ -128,7 +127,7 @@ pub struct TestContext {
     pub root: ChildPath,
     pub temp_dir: ChildPath,
     pub cache_dir: ChildPath,
-    pub python_dir: ChildPath,
+    python_dir: ChildPath,
     pub home_dir: ChildPath,
     pub user_config_dir: ChildPath,
     pub bin_dir: ChildPath,
@@ -136,7 +135,7 @@ pub struct TestContext {
     pub workspace_root: PathBuf,
 
     /// The Python version used for the virtual environment, if any.
-    pub python_version: Option<PythonVersion>,
+    python_version: Option<PythonVersion>,
 
     /// All the Python versions available during this test context.
     pub python_versions: Vec<(PythonVersion, PathBuf)>,
@@ -544,6 +543,7 @@ impl TestContext {
 
     /// Add a filter that ignores temporary directory in path.
     #[must_use]
+    #[cfg(windows)]
     pub fn with_filtered_windows_temp_dir(mut self) -> Self {
         let pattern = regex::escape(
             &self
@@ -680,6 +680,7 @@ impl TestContext {
 
     /// Clear filters on `TestContext`.
     #[must_use]
+    #[cfg(windows)]
     pub fn clear_filters(mut self) -> Self {
         self.filters.clear();
         self
@@ -1150,7 +1151,7 @@ impl TestContext {
     }
 
     /// Only the arguments of [`TestContext::add_shared_options`].
-    pub fn add_shared_args(&self, command: &mut Command) {
+    fn add_shared_args(&self, command: &mut Command) {
         command.arg("--cache-dir").arg(self.cache_dir.path());
     }
 
@@ -1817,6 +1818,7 @@ impl TestContext {
     }
 
     /// Only the filters added to this test context.
+    #[cfg(windows)]
     pub fn filters_without_standard_filters(&self) -> Vec<(&str, &str)> {
         self.filters
             .iter()
@@ -1904,7 +1906,7 @@ impl TestContext {
         );
         assert!(status.success(), "{snapshot}");
         let new_lock = fs_err::read_to_string(&lock_path).unwrap();
-        diff_snapshot(&old_lock, &new_lock)
+        diff_snapshot(&old_lock, &new_lock, 10)
     }
 
     /// Read a file in the temporary directory
@@ -1962,14 +1964,14 @@ impl TestContext {
 
 /// Creates a "unified" diff between the two line-oriented strings suitable
 /// for snapshotting.
-pub fn diff_snapshot(old: &str, new: &str) -> String {
+pub fn diff_snapshot(old: &str, new: &str, context_radius: usize) -> String {
     static TRIM_TRAILING_WHITESPACE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"(?m)^\s+$").unwrap());
 
     let diff = similar::TextDiff::from_lines(old, new);
     let unified = diff
         .unified_diff()
-        .context_radius(10)
+        .context_radius(context_radius)
         .header("old", "new")
         .to_string();
     // Not totally clear why, but some lines end up containing only
@@ -1978,6 +1980,38 @@ pub fn diff_snapshot(old: &str, new: &str) -> String {
     TRIM_TRAILING_WHITESPACE
         .replace_all(&unified, "")
         .into_owned()
+}
+
+/// Assert a snapshot of the diff between `old` and a command's output.
+///
+/// Returns the command's snapshot, this is useful for chaining diffs.
+#[macro_export]
+macro_rules! diff_uv_snapshot {
+    ($filters:expr, $old:expr, $spawnable:expr, @$snapshot:literal) => {{
+        let new = $crate::capture_uv_snapshot!($filters, $spawnable);
+        ::insta::assert_snapshot!($crate::diff_snapshot($old, &new, 3), @$snapshot);
+        new
+    }};
+}
+
+/// Capture a command's output, optionally asserting it against a snapshot.
+#[macro_export]
+macro_rules! capture_uv_snapshot {
+    ($filters:expr, $spawnable:expr) => {{
+        let (snapshot, _) = $crate::run_and_format(
+            $spawnable,
+            &$filters,
+            $crate::function_name!(),
+            Some($crate::WindowsFilters::Platform),
+            None,
+        );
+        snapshot
+    }};
+    ($filters:expr, $spawnable:expr, @$snapshot:literal) => {{
+        let snapshot = $crate::capture_uv_snapshot!($filters, $spawnable);
+        ::insta::assert_snapshot!(snapshot, @$snapshot);
+        snapshot
+    }};
 }
 
 pub fn site_packages_path(venv: &Path, python: &str) -> PathBuf {
@@ -2001,7 +2035,7 @@ pub fn venv_bin_path(venv: impl AsRef<Path>) -> PathBuf {
 }
 
 /// Get the path to the python interpreter for a specific python version.
-pub fn get_python(version: &PythonVersion) -> PathBuf {
+fn get_python(version: &PythonVersion) -> PathBuf {
     ManagedPythonInstallations::from_settings(None)
         .map(|installed_pythons| {
             installed_pythons
@@ -2018,7 +2052,7 @@ pub fn get_python(version: &PythonVersion) -> PathBuf {
 }
 
 /// Create a virtual environment at the given path.
-pub fn create_venv_from_executable<P: AsRef<Path>>(
+fn create_venv_from_executable<P: AsRef<Path>>(
     path: P,
     cache_dir: &ChildPath,
     python: &Path,
@@ -2056,7 +2090,7 @@ pub fn python_path_with_versions(
 /// Returns a list of Python executables for the given versions.
 ///
 /// Generally this should be used with `UV_PYTHON_SEARCH_PATH`.
-pub fn python_installations_for_versions(
+fn python_installations_for_versions(
     temp_dir: &ChildPath,
     python_versions: &[&str],
     download_list: &ManagedPythonDownloadList,
@@ -2064,6 +2098,7 @@ pub fn python_installations_for_versions(
     let cache = Cache::from_path(temp_dir.child("cache").to_path_buf())
         .init_no_wait()?
         .expect("No cache contention when setting up Python in tests");
+    let _preview = uv_preview::test::with_features(&[]);
     let selected_pythons = python_versions
         .iter()
         .map(|python_version| {
@@ -2073,7 +2108,6 @@ pub fn python_installations_for_versions(
                 PythonPreference::Managed,
                 download_list,
                 &cache,
-                Preview::default(),
             ) {
                 python.into_interpreter().sys_executable().to_owned()
             } else {
@@ -2127,7 +2161,7 @@ pub fn run_and_format<T: AsRef<str>>(
 ///
 /// This function is derived from `insta_cmd`s `spawn_with_info`.
 #[expect(clippy::print_stderr)]
-pub fn run_and_format_with_status<T: AsRef<str>>(
+fn run_and_format_with_status<T: AsRef<str>>(
     mut command: impl BorrowMut<Command>,
     filters: impl AsRef<[(T, T)]>,
     function_name: &str,
