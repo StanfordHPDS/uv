@@ -3999,7 +3999,7 @@ pub struct SyncArgs {
     #[arg(long, overrides_with = "active", hide = true)]
     pub no_active: bool,
 
-    /// Do not install the current project.
+    /// Do not install the current project [env: UV_NO_INSTALL_PROJECT=]
     ///
     /// By default, the current project is installed into the environment with all of its
     /// dependencies. The `--no-install-project` option allows the project to be excluded, but all
@@ -4016,7 +4016,7 @@ pub struct SyncArgs {
     #[arg(long, conflicts_with = "no_install_project", hide = true)]
     pub only_install_project: bool,
 
-    /// Do not install any workspace members, including the root project.
+    /// Do not install any workspace members, including the root project [env: UV_NO_INSTALL_WORKSPACE=]
     ///
     /// By default, all workspace members and their dependencies are installed into the
     /// environment. The `--no-install-workspace` option allows exclusion of all the workspace
@@ -4033,7 +4033,7 @@ pub struct SyncArgs {
     #[arg(long, conflicts_with = "no_install_workspace", hide = true)]
     pub only_install_workspace: bool,
 
-    /// Do not install local path dependencies
+    /// Do not install local path dependencies [env: UV_NO_INSTALL_LOCAL=]
     ///
     /// Skips the current project, workspace members, and any other local (path or editable)
     /// packages. Only remote/indexed dependencies are installed. Useful in Docker builds to cache
@@ -4501,7 +4501,7 @@ pub struct AddArgs {
     #[arg(long, overrides_with = "workspace")]
     pub no_workspace: bool,
 
-    /// Do not install the current project.
+    /// Do not install the current project [env: UV_NO_INSTALL_PROJECT=]
     ///
     /// By default, the current project is installed into the environment with all of its
     /// dependencies. The `--no-install-project` option allows the project to be excluded, but all of
@@ -4529,7 +4529,7 @@ pub struct AddArgs {
     )]
     pub only_install_project: bool,
 
-    /// Do not install any workspace members, including the current project.
+    /// Do not install any workspace members, including the current project [env: UV_NO_INSTALL_WORKSPACE=]
     ///
     /// By default, all workspace members and their dependencies are installed into the
     /// environment. The `--no-install-workspace` option allows exclusion of all the workspace
@@ -4557,7 +4557,7 @@ pub struct AddArgs {
     )]
     pub only_install_workspace: bool,
 
-    /// Do not install local path dependencies
+    /// Do not install local path dependencies [env: UV_NO_INSTALL_LOCAL=]
     ///
     /// Skips the current project, workspace members, and any other local (path or editable)
     /// packages. Only remote/indexed dependencies are installed. Useful in Docker builds to cache
@@ -4972,6 +4972,20 @@ pub struct ExportArgs {
 
     #[arg(long, overrides_with("no_header"), hide = true)]
     pub header: bool,
+
+    /// Include `--index-url` and `--extra-index-url` entries in the generated output file.
+    #[arg(long, overrides_with("no_emit_index_url"))]
+    pub emit_index_url: bool,
+
+    #[arg(long, overrides_with("emit_index_url"), hide = true)]
+    pub no_emit_index_url: bool,
+
+    /// Include `--find-links` entries in the generated output file.
+    #[arg(long, overrides_with("no_emit_find_links"))]
+    pub emit_find_links: bool,
+
+    #[arg(long, overrides_with("emit_find_links"), hide = true)]
+    pub no_emit_find_links: bool,
 
     /// Export any non-editable dependencies, including the project and any workspace members, as
     /// editable.

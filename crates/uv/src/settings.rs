@@ -25,8 +25,9 @@ use uv_cli::{
     AuthorFrom, BuildArgs, CheckArgs, ExportArgs, FormatArgs, PublishArgs, PythonDirArgs,
     ResolverInstallerArgs, ToolUpgradeArgs,
     options::{
-        Flag, FlagSource, check_conflicts, flag, resolve_flag, resolve_flag_pair,
-        resolver_installer_options, resolver_options,
+        Flag, FlagSource, check_conflicts, flag, indexes_from_args, resolve_flag,
+        resolve_flag_pair, resolver_installer_options, resolver_installer_options_with_indexes,
+        resolver_options,
     },
 };
 use uv_client::Connectivity;
@@ -1793,6 +1794,46 @@ impl SyncSettings {
             Some(environment.no_editable),
         );
 
+        let (no_install_project, only_install_project) = resolve_flag_pair(
+            no_install_project,
+            only_install_project,
+            "no-install-project",
+            "only-install-project",
+            Some(environment.no_install_project),
+            Some(environment.only_install_project),
+        );
+        let (no_install_workspace, only_install_workspace) = resolve_flag_pair(
+            no_install_workspace,
+            only_install_workspace,
+            "no-install-workspace",
+            "only-install-workspace",
+            Some(environment.no_install_workspace),
+            Some(environment.only_install_workspace),
+        );
+        let (no_install_local, only_install_local) = resolve_flag_pair(
+            no_install_local,
+            only_install_local,
+            "no-install-local",
+            "only-install-local",
+            Some(environment.no_install_local),
+            Some(environment.only_install_local),
+        );
+        check_conflicts(no_install_project, only_install_project);
+        check_conflicts(no_install_workspace, only_install_workspace);
+        check_conflicts(no_install_local, only_install_local);
+        if script.is_some() {
+            let script = Flag::from_cli("script");
+            check_conflicts(no_install_project, script);
+            check_conflicts(no_install_workspace, script);
+            check_conflicts(no_install_local, script);
+        }
+        let no_install_project = no_install_project.is_enabled();
+        let only_install_project = only_install_project.is_enabled();
+        let no_install_workspace = no_install_workspace.is_enabled();
+        let only_install_workspace = only_install_workspace.is_enabled();
+        let no_install_local = no_install_local.is_enabled();
+        let only_install_local = only_install_local.is_enabled();
+
         let malware_settings = MalwareCheckSettings::from(&environment);
 
         Self {
@@ -2091,6 +2132,34 @@ impl AddSettings {
             Some(environment.no_editable),
         );
 
+        let (no_install_project, only_install_project) = resolve_flag_pair(
+            no_install_project,
+            only_install_project,
+            "no-install-project",
+            "only-install-project",
+            Some(environment.no_install_project),
+            Some(environment.only_install_project),
+        );
+        let (no_install_workspace, only_install_workspace) = resolve_flag_pair(
+            no_install_workspace,
+            only_install_workspace,
+            "no-install-workspace",
+            "only-install-workspace",
+            Some(environment.no_install_workspace),
+            Some(environment.only_install_workspace),
+        );
+        let (no_install_local, only_install_local) = resolve_flag_pair(
+            no_install_local,
+            only_install_local,
+            "no-install-local",
+            "only-install-local",
+            Some(environment.no_install_local),
+            Some(environment.only_install_local),
+        );
+        check_conflicts(no_install_project, only_install_project);
+        check_conflicts(no_install_workspace, only_install_workspace);
+        check_conflicts(no_install_local, only_install_local);
+
         let dependency_type = if let Some(extra) = optional {
             DependencyType::Optional(extra)
         } else if let Some(group) = group {
@@ -2102,23 +2171,11 @@ impl AddSettings {
         };
 
         // Track the `--index` and `--default-index` arguments from the command-line.
-        let indexes = installer
-            .index_args
-            .default_index
-            .clone()
-            .and_then(Maybe::into_option)
-            .into_iter()
-            .chain(
-                installer
-                    .index_args
-                    .index
-                    .clone()
-                    .into_iter()
-                    .flat_map(|v| v.clone())
-                    .flatten()
-                    .filter_map(Maybe::into_option),
-            )
-            .collect::<Vec<_>>();
+        let index = indexes_from_args(
+            installer.index_args.default_index.as_ref(),
+            installer.index_args.index.as_deref(),
+        );
+        let indexes = index.clone().unwrap_or_default();
 
         // Warn user if an ambiguous relative path was passed as a value for
         // `--index` or `--default-index`.
@@ -2180,6 +2237,38 @@ impl AddSettings {
         // Check for conflicts between no_sync and frozen.
         check_conflicts(no_sync, frozen);
 
+        let no_install_package_flag = if no_install_package.is_empty() {
+            Flag::disabled()
+        } else {
+            Flag::from_cli("no-install-package")
+        };
+        let only_install_package_flag = if only_install_package.is_empty() {
+            Flag::disabled()
+        } else {
+            Flag::from_cli("only-install-package")
+        };
+
+        for install_flag in [
+            no_install_project,
+            no_install_workspace,
+            no_install_local,
+            only_install_project,
+            only_install_workspace,
+            only_install_local,
+            no_install_package_flag,
+            only_install_package_flag,
+        ] {
+            check_conflicts(install_flag, frozen);
+            check_conflicts(install_flag, no_sync);
+        }
+
+        let no_install_project = no_install_project.is_enabled();
+        let only_install_project = only_install_project.is_enabled();
+        let no_install_workspace = no_install_workspace.is_enabled();
+        let only_install_workspace = only_install_workspace.is_enabled();
+        let no_install_local = no_install_local.is_enabled();
+        let only_install_local = only_install_local.is_enabled();
+
         let malware_settings = MalwareCheckSettings::from(&environment);
 
         Self {
@@ -2221,7 +2310,7 @@ impl AddSettings {
             refresh: Refresh::from(refresh),
             indexes,
             settings: ResolverInstallerSettings::combine(
-                resolver_installer_options(installer, build),
+                resolver_installer_options_with_indexes(installer, build, index),
                 filesystem,
                 &environment,
             ),
@@ -2557,6 +2646,8 @@ pub(crate) struct ExportSettings {
     pub(crate) frozen: Option<FrozenSource>,
     pub(crate) include_annotations: bool,
     pub(crate) include_header: bool,
+    pub(crate) include_index_url: bool,
+    pub(crate) include_find_links: bool,
     pub(crate) script: Option<PathBuf>,
     pub(crate) python: Option<String>,
     pub(crate) install_mirrors: PythonInstallMirrors,
@@ -2592,6 +2683,10 @@ impl ExportSettings {
             no_annotate,
             header,
             no_header,
+            emit_index_url,
+            no_emit_index_url,
+            emit_find_links,
+            no_emit_find_links,
             editable,
             no_editable,
             no_editable_package,
@@ -2691,6 +2786,10 @@ impl ExportSettings {
             frozen: resolve_frozen(frozen),
             include_annotations: flag(annotate, no_annotate, "annotate").unwrap_or(true),
             include_header: flag(header, no_header, "header").unwrap_or(true),
+            include_index_url: flag(emit_index_url, no_emit_index_url, "emit-index-url")
+                .unwrap_or(false),
+            include_find_links: flag(emit_find_links, no_emit_find_links, "emit-find-links")
+                .unwrap_or(false),
             script,
             python: python.and_then(Maybe::into_option),
             refresh: Refresh::from(refresh),
