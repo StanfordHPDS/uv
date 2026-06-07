@@ -7518,6 +7518,49 @@ fn find_links() {
     );
 }
 
+/// Install the latest version across multiple `--find-links` directories.
+#[test]
+fn find_links_multiple() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let links_dir = context.workspace_root.join("test/links");
+
+    let first_links_dir = context.temp_dir.child("first-links");
+    first_links_dir.create_dir_all()?;
+    fs::copy(
+        links_dir.join("ok-1.0.0-py3-none-any.whl"),
+        first_links_dir.child("ok-1.0.0-py3-none-any.whl").path(),
+    )?;
+
+    let second_links_dir = context.temp_dir.child("second-links");
+    second_links_dir.create_dir_all()?;
+    fs::copy(
+        links_dir.join("ok-2.0.0-py3-none-any.whl"),
+        second_links_dir.child("ok-2.0.0-py3-none-any.whl").path(),
+    )?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .env_remove(EnvVars::UV_EXCLUDE_NEWER)
+        .arg("ok")
+        .arg("--no-index")
+        .arg("--find-links")
+        .arg(first_links_dir.path())
+        .arg("--find-links")
+        .arg(second_links_dir.path()), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + ok==2.0.0
+    "
+    );
+
+    Ok(())
+}
+
 /// Install from a `--find-links` HTML page with uppercase tag and attribute names.
 #[tokio::test]
 async fn find_links_uppercase_html() -> Result<()> {
@@ -8136,27 +8179,27 @@ fn install_with_overrides_from_stdin() -> Result<()> {
     Ok(())
 }
 
-/// Install with excludes from stdin.
+/// Install with a direct exclusion from stdin.
 #[test]
 #[expect(clippy::disallowed_types)]
 fn install_with_excludes_from_stdin() -> Result<()> {
     let context = uv_test::test_context!("3.12");
 
     let excludes_txt = context.temp_dir.child("excludes.txt");
-    excludes_txt.write_str("anyio>4.0.0")?;
+    excludes_txt.write_str("anyio")?;
 
     uv_snapshot!(context.pip_install()
         .arg("anyio==4.0.1")
         .arg("--exclude")
         .arg("-")
         .stdin(std::fs::File::open(excludes_txt)?), @"
-    success: false
-    exit_code: 1
+    success: true
+    exit_code: 0
     ----- stdout -----
 
     ----- stderr -----
-      × No solution found when resolving dependencies:
-      ╰─▶ Because there is no version of anyio==4.0.1 and you require anyio==4.0.1, we can conclude that your requirements are unsatisfiable.
+    Resolved in [TIME]
+    Checked in [TIME]
     "
     );
 
