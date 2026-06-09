@@ -35,7 +35,7 @@ jobs:
         run: rustup show
 
       - name: "Install codspeed"
-        uses: taiki-e/install-action@213ccc1a076163c093f914550b94feb90fab916d # v2.79.2
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
         with:
           tool: cargo-codspeed
 
@@ -72,7 +72,7 @@ jobs:
           persist-credentials: false
 
       - name: "Install codspeed"
-        uses: taiki-e/install-action@213ccc1a076163c093f914550b94feb90fab916d # v2.79.2
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
         with:
           tool: cargo-codspeed
 
@@ -88,7 +88,7 @@ jobs:
         run: ./target/debug/uv venv --cache-dir .cache
 
       - name: "Run benchmarks"
-        uses: CodSpeedHQ/action@3194d9a39c4d46684cb44bf7207fc56626aad8fd # v4.15.1
+        uses: CodSpeedHQ/action@9d332c4d90b43981c3e55ae8e38e68709996240f # v4.17.0
         with:
           run: cargo codspeed run
           mode: walltime
@@ -113,7 +113,7 @@ jobs:
         run: rustup show
 
       - name: "Install codspeed"
-        uses: taiki-e/install-action@213ccc1a076163c093f914550b94feb90fab916d # v2.79.2
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
         with:
           tool: cargo-codspeed
 
@@ -129,7 +129,7 @@ jobs:
         run: cargo codspeed build --profile profiling -p uv-bench
 
       - name: "Run benchmarks"
-        uses: CodSpeedHQ/action@3194d9a39c4d46684cb44bf7207fc56626aad8fd # v4.15.1
+        uses: CodSpeedHQ/action@9d332c4d90b43981c3e55ae8e38e68709996240f # v4.17.0
         with:
           run: cargo codspeed run
           mode: simulation
