@@ -2178,6 +2178,7 @@ impl VirtualProject {
 #[cfg(test)]
 #[cfg(unix)] // Avoid path escaping for the unit tests
 mod tests {
+    use std::collections::BTreeMap;
     use std::env;
     use std::path::Path;
     use std::str::FromStr;
@@ -3244,6 +3245,7 @@ mod tests {
 [dependency-groups]
 foo = ["a", {include-group = "bar"}]
 bar = ["b"]
+future = [{include-group = "bar", unknown = "value"}]
 "#;
 
         let result = PyProjectToml::from_string(toml.to_string(), "pyproject.toml")
@@ -3272,6 +3274,43 @@ bar = ["b"]
             bar,
             &[DependencyGroupSpecifier::Requirement("b".to_string())]
         );
+
+        let future = groups
+            .get(&GroupName::from_str("future").unwrap())
+            .expect("Group `future` should be present");
+        assert_eq!(
+            future,
+            &[DependencyGroupSpecifier::Object(BTreeMap::from([
+                ("include-group".to_string(), "bar".to_string()),
+                ("unknown".to_string(), "value".to_string()),
+            ]))]
+        );
+    }
+
+    #[test]
+    fn reject_colliding_optional_dependency_names() {
+        let err = PyProjectToml::from_string(
+            r#"
+[project]
+name = "example"
+version = "1.0.0"
+
+[project.optional-dependencies]
+foo-bar = ["anyio"]
+foo_bar = ["iniconfig"]
+"#
+            .to_string(),
+            "pyproject.toml",
+        )
+        .unwrap_err();
+
+        assert_snapshot!(err.to_string(), @r#"
+        TOML parse error at line 6, column 1
+          |
+        6 | [project.optional-dependencies]
+          | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        duplicate normalized extra name `foo-bar`
+        "#);
     }
 
     #[tokio::test]
