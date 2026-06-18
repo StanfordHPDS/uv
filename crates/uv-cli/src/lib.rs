@@ -75,6 +75,8 @@ pub enum AuditOutputFormat {
     Text,
     /// Display the result in JSON format.
     Json,
+    /// Display the result in SARIF format.
+    Sarif,
 }
 
 #[derive(Debug, Default, Clone, clap::ValueEnum)]
@@ -5387,6 +5389,10 @@ pub struct CheckArgs {
     /// By default, a constrained version range of ty will be used (e.g., `>=0.0,<0.1`).
     #[arg(long, value_hint = ValueHint::Other)]
     pub ty_version: Option<String>,
+
+    /// Display the version of ty that will be used for type checking.
+    #[arg(long, hide = true)]
+    pub show_version: bool,
 
     /// Avoid discovering a project or workspace.
     ///
