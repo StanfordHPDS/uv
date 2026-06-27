@@ -19,8 +19,9 @@ use uv_configuration::{
 use uv_dispatch::{BuildDispatch, SharedState};
 use uv_distribution::{DistributionDatabase, LoweredExtraBuildDependencies, LoweredRequirement};
 use uv_distribution_types::{
-    ExtraBuildRequirement, ExtraBuildRequires, Index, IndexCredentialsError, Requirement,
-    RequiresPython, Resolution, UnresolvedRequirement, UnresolvedRequirementSpecification,
+    ExtraBuildRequirement, ExtraBuildRequires, HashGeneration, Index, IndexCredentialsError,
+    Requirement, RequiresPython, Resolution, UnresolvedRequirement,
+    UnresolvedRequirementSpecification,
 };
 use uv_fs::{CWD, LockedFile, LockedFileError, LockedFileMode, Simplified, verbatim_path};
 use uv_git::ResolvedRepositoryReference;
@@ -549,7 +550,7 @@ impl PlatformState {
     }
 
     /// Create a [`SharedState`] from the [`PlatformState`].
-    fn into_inner(self) -> SharedState {
+    pub(crate) fn into_inner(self) -> SharedState {
         self.0
     }
 }
@@ -1098,7 +1099,7 @@ fn discover_project_environment(
 }
 
 /// Return whether to use centralized project environments for this invocation.
-fn centralized_environments_enabled(
+pub(crate) fn centralized_environments_enabled(
     selection: &ProjectEnvironmentSelection,
     cache: &Cache,
 ) -> bool {
@@ -1115,7 +1116,7 @@ fn centralized_environments_enabled(
 }
 
 /// Return whether `path` is a link into the current cache's environment bucket.
-fn is_centralized_environment_link(path: &Path, cache: &Cache) -> bool {
+pub(crate) fn is_centralized_environment_link(path: &Path, cache: &Cache) -> bool {
     let Ok(target) = fs_err::read_link(path) else {
         return false;
     };
@@ -1139,7 +1140,7 @@ fn is_centralized_environment_link(path: &Path, cache: &Cache) -> bool {
 }
 
 /// Return the centralized environment path for a given workspace and interpreter.
-fn centralized_environment_root(
+pub(crate) fn centralized_environment_root(
     workspace: &Workspace,
     interpreter: &Interpreter,
     upgradeable: bool,
@@ -1202,12 +1203,13 @@ pub(crate) enum LinkErrorReporting {
     Log,
 }
 
-/// Point the workspace's `.venv` to the centralized environment.
-fn update_project_environment_link(
+/// Point the workspace's `.venv` to the centralized environment, returning whether the link was
+/// successfully updated.
+pub(crate) fn update_project_environment_link(
     environment: &PythonEnvironment,
     workspace: &Workspace,
     link_error_reporting: LinkErrorReporting,
-) {
+) -> bool {
     let link = workspace.install_path().join(".venv");
     let report_error = |message: &str, err: &std::io::Error| match link_error_reporting {
         LinkErrorReporting::User => {
@@ -1220,22 +1222,26 @@ fn update_project_environment_link(
         if uv_fs::is_virtualenv_base(&link) {
             if let Err(err) = uv_fs::remove_virtualenv(&link) {
                 report_error("Failed to remove existing local virtual environment", &err);
-                return;
+                return false;
             }
         } else {
             // On Windows, copying a junction can produce an empty directory.
             #[cfg(windows)]
             if let Err(err) = fs_err::remove_dir(&link) {
                 report_error("Failed to create link to project environment", &err);
-                return;
+                return false;
             }
         }
     }
 
     // TODO(tk): When directory links are unavailable, write `.venv` as a file containing the
     // environment path.
-    if let Err(err) = uv_fs::replace_symlink(environment.root(), &link) {
-        report_error("Failed to create link to project environment", &err);
+    match uv_fs::replace_symlink(environment.root(), &link) {
+        Ok(()) => true,
+        Err(err) => {
+            report_error("Failed to create link to project environment", &err);
+            false
+        }
     }
 }
 
@@ -2300,7 +2306,7 @@ impl From<RequirementsSpecification> for EnvironmentSpecification<'_> {
 impl<'lock> EnvironmentSpecification<'lock> {
     /// Set the [`PreferenceLocation`] for the specification.
     #[must_use]
-    fn with_preferences(self, preferences: PreferenceLocation<'lock>) -> Self {
+    pub(crate) fn with_preferences(self, preferences: PreferenceLocation<'lock>) -> Self {
         Self {
             preferences: Some(preferences),
             ..self
@@ -2308,9 +2314,16 @@ impl<'lock> EnvironmentSpecification<'lock> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum EnvironmentResolution {
+    Specific,
+    Universal,
+}
+
 /// Run dependency resolution for an interpreter, returning the [`ResolverOutput`].
 pub(crate) async fn resolve_environment(
     spec: EnvironmentSpecification<'_>,
+    resolution_scope: EnvironmentResolution,
     interpreter: &Interpreter,
     python_platform: Option<&TargetTriple>,
     source_tree_editable_policy: SourceTreeEditablePolicy,
@@ -2342,7 +2355,7 @@ pub(crate) async fn resolve_environment(
         extra_build_variables,
         exclude_newer,
         link_mode,
-        upgrade: _,
+        upgrade,
         build_options,
         sources,
         torch_backend,
@@ -2364,10 +2377,30 @@ pub(crate) async fn resolve_environment(
 
     let client_builder = client_builder.clone().keyring(*keyring_provider);
 
-    // Determine the tags, markers, and interpreter to use for resolution.
-    let tags = pip::resolution_tags(None, python_platform, interpreter)?;
-    let marker_env = pip::resolution_markers(None, python_platform, interpreter);
-    let python_requirement = PythonRequirement::from_interpreter(interpreter);
+    // Determine the tags and marker environment to use for resolution.
+    let (tags, resolver_environment) = match resolution_scope {
+        EnvironmentResolution::Specific => {
+            let tags = pip::resolution_tags(None, python_platform, interpreter)?;
+            let marker_environment = pip::resolution_markers(None, python_platform, interpreter);
+            (
+                Some(tags),
+                ResolverEnvironment::specific(marker_environment),
+            )
+        }
+        EnvironmentResolution::Universal => (None, ResolverEnvironment::universal(Vec::new())),
+    };
+    let python_requirement = match resolution_scope {
+        EnvironmentResolution::Specific => PythonRequirement::from_interpreter(interpreter),
+        EnvironmentResolution::Universal => PythonRequirement::from_requires_python(
+            interpreter,
+            RequiresPython::greater_than_equal_version(&interpreter.python_minor_version()),
+        ),
+    };
+
+    let python_platform = match resolution_scope {
+        EnvironmentResolution::Specific => python_platform,
+        EnvironmentResolution::Universal => None,
+    };
 
     // Determine the PyTorch backend.
     let torch_backend = torch_backend
@@ -2429,13 +2462,20 @@ pub(crate) async fn resolve_environment(
     // optional on the downstream APIs.
     let extras = ExtrasSpecification::default();
     let groups = BTreeMap::new();
-    let hasher = HashStrategy::default();
+    let hasher = match resolution_scope {
+        EnvironmentResolution::Specific => HashStrategy::default(),
+        EnvironmentResolution::Universal => HashStrategy::Generate(HashGeneration::Url),
+    };
     let build_hasher = HashStrategy::default();
 
-    // When resolving from an interpreter, we assume an empty environment, so reinstalls and
-    // upgrades aren't relevant.
+    // When resolving from an interpreter, we assume an empty environment, so reinstalls aren't
+    // relevant. Upgrades are only relevant for universal resolutions that use an existing lock as
+    // a preference source.
     let reinstall = Reinstall::default();
-    let upgrade = Upgrade::default();
+    let upgrade = match resolution_scope {
+        EnvironmentResolution::Specific => Upgrade::default(),
+        EnvironmentResolution::Universal => upgrade.clone(),
+    };
 
     // If an existing lockfile exists, build up a set of preferences.
     let preferences = match spec.preferences {
@@ -2461,7 +2501,7 @@ pub(crate) async fn resolve_environment(
         let entries = client
             .fetch_all(index_locations.flat_indexes().map(Index::url))
             .await?;
-        FlatIndex::from_entries(entries, Some(&tags), &hasher, build_options)
+        FlatIndex::from_entries(entries, tags.as_deref(), &hasher, build_options)
     };
 
     // Lower the extra build dependencies, if any.
@@ -2513,8 +2553,8 @@ pub(crate) async fn resolve_environment(
         &hasher,
         &reinstall,
         &upgrade,
-        Some(&tags),
-        ResolverEnvironment::specific(marker_env),
+        tags.as_deref(),
+        resolver_environment,
         python_requirement,
         interpreter.markers(),
         Conflicts::empty(),
@@ -2535,6 +2575,7 @@ pub(crate) async fn resolve_environment(
 pub(crate) async fn sync_environment(
     venv: PythonEnvironment,
     resolution: &Resolution,
+    hasher: HashStrategy,
     modifications: Modifications,
     build_constraints: Constraints,
     settings: InstallerSettingsRef<'_>,
@@ -2594,7 +2635,6 @@ pub(crate) async fn sync_environment(
     // optional on the downstream APIs.
     let build_hasher = HashStrategy::default();
     let dry_run = DryRun::default();
-    let hasher = HashStrategy::default();
     let workspace_cache = WorkspaceCache::default();
 
     // Resolve the flat indexes from `--find-links`.
@@ -2769,6 +2809,7 @@ pub(crate) async fn update_environment(
             &constraints,
             &overrides,
             &override_dependencies,
+            &excludes,
             InstallationStrategy::Permissive,
             &marker_env,
             &tags,
@@ -3210,8 +3251,9 @@ pub(crate) fn script_specification(
         .collect::<Vec<_>>();
 
     let mut specification =
-        RequirementsSpecification::from_excludes(requirements, constraints, Vec::new(), excludes);
+        RequirementsSpecification::from_excludes(requirements, constraints, Vec::new(), Vec::new());
     specification.override_dependencies = overrides;
+    specification.excludes = excludes;
     Ok(Some(specification))
 }
 

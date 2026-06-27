@@ -26,7 +26,7 @@ use uv_distribution_types::{
     ConfigSettings, DependencyMetadata, ExtraBuildVariables, Index, IndexLocations,
     PackageConfigSettings, Requirement, SourceDist,
 };
-use uv_fs::{Simplified, relative_to};
+use uv_fs::{Simplified, normalize_path, relative_to};
 use uv_install_wheel::LinkMode;
 use uv_normalize::PackageName;
 use uv_pep440::Version;
@@ -370,6 +370,20 @@ async fn build_impl(
     } else {
         vec![AnnotatedSource::from(src)]
     };
+
+    // Build backends can include arbitrary files from the source directory in the distribution.
+    // Reject an active cache within the source to avoid including cache contents in the build.
+    for source in &packages {
+        if let Source::Directory(source_dir) = &source.source
+            && is_path_within(cache.root(), source_dir)
+        {
+            return Err(anyhow::anyhow!(
+                "The cache directory `{}` is inside the build source directory `{}`",
+                cache.root().user_display(),
+                source_dir.user_display()
+            ));
+        }
+    }
 
     let results: Vec<_> = futures::future::join_all(packages.into_iter().map(|source| {
         let future = build_package(
@@ -1253,6 +1267,19 @@ impl Source<'_> {
             Self::Directory(path) => path,
         }
     }
+}
+
+/// Return `true` if `path` is within `directory`, resolving symlinks when possible.
+fn is_path_within(path: &Path, directory: &Path) -> bool {
+    if let Ok(path) = fs_err::canonicalize(path)
+        && let Ok(directory) = fs_err::canonicalize(directory)
+    {
+        return path.starts_with(directory);
+    }
+
+    let path = normalize_path(path);
+    let directory = normalize_path(directory);
+    path.starts_with(directory.as_ref())
 }
 
 /// We run all builds in parallel, so we wait until all builds are done to show the success messages

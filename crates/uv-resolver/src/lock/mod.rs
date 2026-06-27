@@ -20,8 +20,8 @@ use url::Url;
 
 use uv_cache_key::RepositoryUrl;
 use uv_configuration::{
-    BuildOptions, Constraints, DependencyGroupsWithDefaults, ExtrasSpecificationWithDefaults,
-    InstallTarget, Override, PackageOverride,
+    BuildOptions, Constraints, DependencyGroupsWithDefaults, ExcludeDependency,
+    ExtrasSpecificationWithDefaults, InstallTarget, Override, PackageOverride,
 };
 use uv_distribution::{DistributionDatabase, FlatRequiresDist, RequiresDist};
 use uv_distribution_filename::{
@@ -303,6 +303,34 @@ pub struct Lock {
     manifest: ResolverManifest,
 }
 
+/// Package selections from a [`Lock`] for a named direct dependency.
+///
+/// The dependency can come from the lock manifest, a dependency group, the production packages,
+/// or a combination thereof.
+#[derive(Debug)]
+pub struct DependencySelection<'lock> {
+    root: Option<&'lock Package>,
+    production: Option<&'lock Package>,
+    groups: BTreeMap<&'lock GroupName, &'lock Package>,
+}
+
+impl<'lock> DependencySelection<'lock> {
+    /// Returns the package selected by a direct requirement on the lock manifest.
+    pub fn root(&self) -> Option<&'lock Package> {
+        self.root
+    }
+
+    /// Returns the package selected by the production dependency.
+    pub fn production(&self) -> Option<&'lock Package> {
+        self.production
+    }
+
+    /// Returns the package selected by the given dependency group.
+    pub fn group(&self, group: &GroupName) -> Option<&'lock Package> {
+        self.groups.get(group).copied()
+    }
+}
+
 impl Lock {
     /// Initialize a [`Lock`] from a [`ResolverOutput`].
     pub fn from_resolution(
@@ -325,31 +353,22 @@ impl Lock {
             }
             Some(UniversalMarker::new(combined, ConflictMarker::TRUE))
         };
+        let environment = SimplifiedMarkerTree::new(
+            &requires_python,
+            fork_markers_union(&resolution.fork_markers, &requires_python),
+        );
 
         // Determine the set of packages included at multiple versions.
         let mut seen = FxHashSet::default();
         let mut duplicates = FxHashSet::default();
-        for node_index in resolution.graph.node_indices() {
-            let ResolutionGraphNode::Dist(dist) = &resolution.graph[node_index] else {
-                continue;
-            };
-            if !dist.is_base() {
-                continue;
-            }
+        for (_, dist) in resolution.base_dists() {
             if !seen.insert(dist.name()) {
                 duplicates.insert(dist.name());
             }
         }
 
         // Lock all base packages.
-        for node_index in resolution.graph.node_indices() {
-            let ResolutionGraphNode::Dist(dist) = &resolution.graph[node_index] else {
-                continue;
-            };
-            if !dist.is_base() {
-                continue;
-            }
-
+        for (node_index, dist) in resolution.base_dists() {
             // If there are multiple distributions for the same package, include the markers of all
             // forks that included the current distribution.
             //
@@ -388,7 +407,12 @@ impl Lock {
                 else {
                     continue;
                 };
-                let marker = *edge.weight();
+                let marker = simplify_dependency_marker(
+                    &requires_python,
+                    environment,
+                    dist.marker,
+                    *edge.weight(),
+                );
                 package.add_dependency(&requires_python, dependency_dist, marker, root)?;
             }
 
@@ -421,7 +445,12 @@ impl Lock {
                     else {
                         continue;
                     };
-                    let marker = *edge.weight();
+                    let marker = simplify_dependency_marker(
+                        &requires_python,
+                        environment,
+                        dist.marker,
+                        *edge.weight(),
+                    );
                     package.add_optional_dependency(
                         &requires_python,
                         extra.clone(),
@@ -446,7 +475,12 @@ impl Lock {
                     else {
                         continue;
                     };
-                    let marker = *edge.weight();
+                    let marker = simplify_dependency_marker(
+                        &requires_python,
+                        environment,
+                        dist.marker,
+                        *edge.weight(),
+                    );
                     package.add_group_dependency(
                         &requires_python,
                         group.clone(),
@@ -796,119 +830,91 @@ impl Lock {
         &self.manifest.dependency_groups
     }
 
-    /// Returns the package selected by a direct dependency in a dependency group.
+    /// Returns the environment-specific direct dependency selections for a lock target.
     ///
-    /// If `project_name` is provided, the dependency group attached to that package is used.
-    /// Otherwise, the dependency group attached directly to the lock manifest is used.
-    pub fn find_dependency_group_package(
-        &self,
+    /// If `project_name` is provided, dependencies attached to that package are used. Otherwise,
+    /// requirements and dependency groups attached directly to the lock manifest are used.
+    pub fn dependency_selection<'lock>(
+        &'lock self,
         project_name: Option<&PackageName>,
-        group: &GroupName,
         dependency_name: &PackageName,
         marker_environment: &MarkerEnvironment,
-    ) -> Result<Option<&Package>, String> {
-        match project_name {
-            Some(project_name) => self.find_project_dependency_group_package(
-                project_name,
-                group,
-                dependency_name,
-                marker_environment,
-            ),
-            None => self.find_virtual_root_dependency_group_package(
-                group,
-                dependency_name,
-                marker_environment,
-            ),
-        }
-    }
-
-    /// Returns `true` if the package is selected by an enabled dependency group.
-    pub fn is_package_in_dependency_groups(
-        &self,
-        project_name: Option<&PackageName>,
-        package: &Package,
-        marker_environment: &MarkerEnvironment,
-        groups: &DependencyGroupsWithDefaults,
-    ) -> Result<bool, String> {
-        match project_name {
-            Some(project_name) => {
-                let Some(project) = self.find_by_name(project_name)? else {
-                    return Ok(false);
-                };
-                for group in project
-                    .resolved_dependency_groups()
-                    .keys()
-                    .filter(|group| groups.contains(group))
-                {
-                    if self.find_project_dependency_group_package(
-                        project_name,
-                        group,
-                        package.name(),
-                        marker_environment,
-                    )? == Some(package)
-                    {
-                        return Ok(true);
-                    }
+    ) -> Result<DependencySelection<'lock>, String> {
+        let (root, production, groups) = if let Some(project_name) = project_name {
+            let Some(project) = self.find_by_name(project_name)? else {
+                return Ok(DependencySelection {
+                    root: None,
+                    production: None,
+                    groups: BTreeMap::new(),
+                });
+            };
+            let production =
+                self.find_project_dependency_package(project, dependency_name, marker_environment)?;
+            let mut groups = BTreeMap::new();
+            for group in project.resolved_dependency_groups().keys() {
+                if let Some(package) = self.find_project_dependency_group_package(
+                    project,
+                    group,
+                    dependency_name,
+                    marker_environment,
+                )? {
+                    groups.insert(group, package);
                 }
             }
-            None => {
-                for group in self
-                    .manifest
-                    .dependency_groups
-                    .keys()
-                    .filter(|group| groups.contains(group))
-                {
-                    if self.find_virtual_root_dependency_group_package(
-                        group,
-                        package.name(),
-                        marker_environment,
-                    )? == Some(package)
-                    {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
-    }
+            (None, production, groups)
+        } else {
+            let root_applies = self.manifest.requirements.iter().any(|requirement| {
+                &requirement.name == dependency_name
+                    && requirement.marker.evaluate(marker_environment, &[])
+            });
 
-    /// Returns the package selected by a dependency group on a virtual workspace root.
-    fn find_virtual_root_dependency_group_package(
-        &self,
-        group: &GroupName,
-        dependency_name: &PackageName,
-        marker_environment: &MarkerEnvironment,
-    ) -> Result<Option<&Package>, String> {
-        let Some(requirements) = self.manifest.dependency_groups.get(group) else {
-            return Ok(None);
+            // Lock-manifest requirements and dependency groups only record requirements, not
+            // resolved package IDs. Select the environment-specific package once, then associate
+            // it with every applicable direct requirement.
+            let mut applicable_groups = self
+                .manifest
+                .dependency_groups
+                .iter()
+                .filter_map(|(group, requirements)| {
+                    requirements
+                        .iter()
+                        .any(|requirement| {
+                            &requirement.name == dependency_name
+                                && requirement.marker.evaluate(marker_environment, &[])
+                        })
+                        .then_some(group)
+                })
+                .peekable();
+            let package = if root_applies || applicable_groups.peek().is_some() {
+                self.find_by_markers(dependency_name, marker_environment)?
+            } else {
+                None
+            };
+            let root = root_applies.then_some(package).flatten();
+            let groups = package.map_or_else(BTreeMap::new, |package| {
+                applicable_groups.map(|group| (group, package)).collect()
+            });
+            (root, None, groups)
         };
-
-        // Confirm that the requested direct dependency applies to this environment before
-        // selecting a package with the same name from the universal lock. For example,
-        // `foo; python_version < '3.12'` must not select a locked `foo` on Python 3.12.
-        if !requirements.iter().any(|requirement| {
-            &requirement.name == dependency_name
-                && requirement.marker.evaluate(marker_environment, &[])
-        }) {
-            return Ok(None);
-        }
-        self.find_by_markers(dependency_name, marker_environment)
+        Ok(DependencySelection {
+            root,
+            production,
+            groups,
+        })
     }
 
     /// Returns the package selected by a dependency group on a non-virtual project.
     fn find_project_dependency_group_package(
         &self,
-        project_name: &PackageName,
+        project: &Package,
         group: &GroupName,
         dependency_name: &PackageName,
         marker_environment: &MarkerEnvironment,
     ) -> Result<Option<&Package>, String> {
-        let Some(project) = self.find_by_name(project_name)? else {
-            return Ok(None);
-        };
         let Some(dependencies) = project.resolved_dependency_groups().get(group) else {
             return Ok(None);
         };
+        let project_name = project.name();
 
         let mut selected = None;
         for dependency in dependencies
@@ -944,15 +950,13 @@ impl Lock {
     }
 
     /// Returns the package selected by a production dependency on a non-virtual project.
-    pub fn find_dependency_package(
+    fn find_project_dependency_package(
         &self,
-        project_name: &PackageName,
+        project: &Package,
         dependency_name: &PackageName,
         marker_environment: &MarkerEnvironment,
     ) -> Result<Option<&Package>, String> {
-        let Some(project) = self.find_by_name(project_name)? else {
-            return Ok(None);
-        };
+        let project_name = project.name();
 
         let mut selected = None;
         for dependency in project
@@ -1227,19 +1231,16 @@ impl Lock {
         self.fork_markers.as_slice()
     }
 
+    /// The marker describing the universe of this resolution.
+    fn fork_markers_union(&self) -> MarkerTree {
+        fork_markers_union(&self.fork_markers, &self.requires_python)
+    }
+
     /// Checks whether the fork markers cover the entire supported marker space.
     ///
     /// Returns the actually covered and the expected marker space on validation error.
     pub fn check_marker_coverage(&self) -> Result<(), (MarkerTree, MarkerTree)> {
-        let fork_markers_union = if self.fork_markers().is_empty() {
-            self.requires_python.to_marker_tree()
-        } else {
-            let mut fork_markers_union = MarkerTree::FALSE;
-            for fork_marker in self.fork_markers() {
-                fork_markers_union.or(fork_marker.pep508());
-            }
-            fork_markers_union
-        };
+        let fork_markers_union = self.fork_markers_union();
         let mut environments_union = if !self.supported_environments.is_empty() {
             let mut environments_union = MarkerTree::FALSE;
             for fork_marker in &self.supported_environments {
@@ -1271,15 +1272,7 @@ impl Lock {
         &self,
         new_requires_python: &RequiresPython,
     ) -> Result<(), (MarkerTree, MarkerTree)> {
-        let fork_markers_union = if self.fork_markers().is_empty() {
-            self.requires_python.to_marker_tree()
-        } else {
-            let mut fork_markers_union = MarkerTree::FALSE;
-            for fork_marker in self.fork_markers() {
-                fork_markers_union.or(fork_marker.pep508());
-            }
-            fork_markers_union
-        };
+        let fork_markers_union = self.fork_markers_union();
         let new_requires_python = new_requires_python.to_marker_tree();
         if fork_markers_union.is_disjoint(new_requires_python) {
             Err((fork_markers_union, new_requires_python))
@@ -1313,6 +1306,11 @@ impl Lock {
                 doc.insert("resolution-markers", value(fork_markers));
             }
         }
+
+        // The simplified marker space covered by this resolution.
+        let simplified_environment =
+            SimplifiedMarkerTree::new(&self.requires_python, self.fork_markers_union())
+                .as_simplified_marker_tree();
 
         if !self.supported_environments.is_empty() {
             let supported_environments = each_element_on_its_line_array(
@@ -1626,7 +1624,11 @@ impl Lock {
 
         let mut packages = ArrayOfTables::new();
         for dist in &self.packages {
-            packages.push(dist.to_toml(&self.requires_python, &dist_count_by_name)?);
+            packages.push(dist.to_toml(
+                &self.requires_python,
+                simplified_environment,
+                &dist_count_by_name,
+            )?);
         }
 
         doc.insert("package", Item::ArrayOfTables(packages));
@@ -1814,7 +1816,7 @@ impl Lock {
         requirements: &[Requirement],
         constraints: &[Requirement],
         overrides: &[Override<Requirement>],
-        excludes: &[PackageName],
+        excludes: &[ExcludeDependency],
         build_constraints: &[Requirement],
         dependency_groups: &BTreeMap<GroupName, Vec<Requirement>>,
         dependency_metadata: &DependencyMetadata,
@@ -2660,7 +2662,7 @@ pub enum SatisfiesResult<'lock> {
         BTreeSet<Override<Requirement>>,
     ),
     /// The lockfile uses a different set of excludes.
-    MismatchedExcludes(BTreeSet<PackageName>, BTreeSet<PackageName>),
+    MismatchedExcludes(BTreeSet<ExcludeDependency>, BTreeSet<ExcludeDependency>),
     /// The lockfile uses a different set of build constraints.
     MismatchedBuildConstraints(BTreeSet<Requirement>, BTreeSet<Requirement>),
     /// The lockfile uses a different set of dependency groups.
@@ -2790,7 +2792,7 @@ pub struct ResolverManifest {
     overrides: BTreeSet<Override<Requirement>>,
     /// The excludes provided to the resolver.
     #[serde(default)]
-    excludes: BTreeSet<PackageName>,
+    excludes: BTreeSet<ExcludeDependency>,
     /// The build constraints provided to the resolver.
     #[serde(default)]
     build_constraints: BTreeSet<Requirement>,
@@ -2807,7 +2809,7 @@ impl ResolverManifest {
         requirements: impl IntoIterator<Item = Requirement>,
         constraints: impl IntoIterator<Item = Requirement>,
         overrides: impl IntoIterator<Item = Override<Requirement>>,
-        excludes: impl IntoIterator<Item = PackageName>,
+        excludes: impl IntoIterator<Item = ExcludeDependency>,
         build_constraints: impl IntoIterator<Item = Requirement>,
         dependency_groups: impl IntoIterator<Item = (GroupName, Vec<Requirement>)>,
         dependency_metadata: impl IntoIterator<Item = StaticMetadata>,
@@ -2930,10 +2932,20 @@ impl TryFrom<LockWire> for Lock {
             unambiguous_package_ids.insert(dist.id.name.clone(), dist.id.clone());
         }
 
+        let fork_markers = wire
+            .fork_markers
+            .into_iter()
+            .map(|simplified_marker| simplified_marker.into_marker(&wire.requires_python))
+            .map(UniversalMarker::from_combined)
+            .collect::<Vec<_>>();
+        let environment = SimplifiedMarkerTree::new(
+            &wire.requires_python,
+            fork_markers_union(&fork_markers, &wire.requires_python),
+        );
         let packages = wire
             .packages
             .into_iter()
-            .map(|dist| dist.unwire(&wire.requires_python, &unambiguous_package_ids))
+            .map(|dist| dist.unwire(&wire.requires_python, environment, &unambiguous_package_ids))
             .collect::<Result<Vec<_>, _>>()?;
         let supported_environments = wire
             .supported_environments
@@ -2944,12 +2956,6 @@ impl TryFrom<LockWire> for Lock {
             .required_environments
             .into_iter()
             .map(|simplified_marker| simplified_marker.into_marker(&wire.requires_python))
-            .collect();
-        let fork_markers = wire
-            .fork_markers
-            .into_iter()
-            .map(|simplified_marker| simplified_marker.into_marker(&wire.requires_python))
-            .map(UniversalMarker::from_combined)
             .collect();
         let mut options = wire.options;
         if options.exclude_newer.exclude_newer_span.is_some() {
@@ -3674,6 +3680,7 @@ impl Package {
     fn to_toml(
         &self,
         requires_python: &RequiresPython,
+        simplified_environment: MarkerTree,
         dist_count_by_name: &FxHashMap<PackageName, u64>,
     ) -> Result<Table, toml_edit::ser::Error> {
         let mut table = Table::new();
@@ -3691,7 +3698,7 @@ impl Package {
 
         if !self.dependencies.is_empty() {
             let deps = each_element_on_its_line_array(self.dependencies.iter().map(|dep| {
-                dep.to_toml(requires_python, dist_count_by_name)
+                dep.to_toml(simplified_environment, dist_count_by_name)
                     .into_inline_table()
             }));
             table.insert("dependencies", value(deps));
@@ -3701,7 +3708,7 @@ impl Package {
             let mut optional_deps = Table::new();
             for (extra, deps) in &self.optional_dependencies {
                 let deps = each_element_on_its_line_array(deps.iter().map(|dep| {
-                    dep.to_toml(requires_python, dist_count_by_name)
+                    dep.to_toml(simplified_environment, dist_count_by_name)
                         .into_inline_table()
                 }));
                 if !deps.is_empty() {
@@ -3717,7 +3724,7 @@ impl Package {
             let mut dependency_groups = Table::new();
             for (extra, deps) in &self.dependency_groups {
                 let deps = each_element_on_its_line_array(deps.iter().map(|dep| {
-                    dep.to_toml(requires_python, dist_count_by_name)
+                    dep.to_toml(simplified_environment, dist_count_by_name)
                         .into_inline_table()
                 }));
                 if !deps.is_empty() {
@@ -4027,6 +4034,7 @@ impl PackageWire {
     fn unwire(
         self,
         requires_python: &RequiresPython,
+        environment: SimplifiedMarkerTree,
         unambiguous_package_ids: &FxHashMap<PackageName, PackageId>,
     ) -> Result<Package, LockError> {
         // Consistency check
@@ -4050,7 +4058,7 @@ impl PackageWire {
 
         let unwire_deps = |deps: Vec<DependencyWire>| -> Result<Vec<Dependency>, LockError> {
             deps.into_iter()
-                .map(|dep| dep.unwire(requires_python, unambiguous_package_ids))
+                .map(|dep| dep.unwire(requires_python, environment, unambiguous_package_ids))
                 .collect()
         };
 
@@ -5682,16 +5690,17 @@ pub struct Dependency {
     package_id: PackageId,
     extra: BTreeSet<ExtraName>,
     /// A marker simplified from the PEP 508 marker in `complexified_marker`
-    /// by assuming `requires-python` is satisfied. So if
+    /// by assuming `requires-python` and the PEP 508 portion of the parent package's reachability
+    /// marker are satisfied. The parent's conflict predicates are retained for compatibility with
+    /// older lockfile readers. So if
     /// `requires-python = '>=3.8'`, then
     /// `python_version >= '3.8' and python_version < '3.12'`
     /// gets simplified to `python_version < '3.12'`.
     ///
-    /// Generally speaking, this marker should not be exposed to
-    /// anything outside this module unless it's for a specialized use
-    /// case. But specifically, it should never be used to evaluate
-    /// against a marker environment or for disjointness checks or any
-    /// other kind of marker algebra.
+    /// Generally speaking, this marker should not be exposed to anything outside this module
+    /// unless it's for a specialized use case. But specifically, it should never be used to
+    /// evaluate against a marker environment or for disjointness checks or any other kind of
+    /// marker algebra. It is only meaningful while traversing from its parent package.
     ///
     /// It exists because there are some cases where we do actually
     /// want to compare markers in their "simplified" form. For
@@ -5701,9 +5710,9 @@ pub struct Dependency {
     /// `requires-python` applies to the entire lock file, it's
     /// acceptable to do comparisons on the simplified form.
     simplified_marker: SimplifiedMarkerTree,
-    /// The "complexified" marker is a universal marker whose PEP 508
-    /// marker can stand on its own independent of `requires-python`.
-    /// It can be safely used for any kind of marker algebra.
+    /// The "complexified" marker is independent of `requires-python`, but remains contextual to
+    /// the PEP 508 reachability of its parent package. It can be evaluated while traversing
+    /// dependencies from that package.
     complexified_marker: UniversalMarker,
 }
 
@@ -5744,7 +5753,7 @@ impl Dependency {
     /// Returns the TOML representation of this dependency.
     fn to_toml(
         &self,
-        _requires_python: &RequiresPython,
+        simplified_environment: MarkerTree,
         dist_count_by_name: &FxHashMap<PackageName, u64>,
     ) -> Table {
         let mut table = Table::new();
@@ -5758,7 +5767,13 @@ impl Dependency {
                 .collect::<Array>();
             table.insert("extra", value(extra_array));
         }
-        if let Some(marker) = self.simplified_marker.try_to_string() {
+        // Avoid restating the resolution's environment on every dependency edge.
+        if let Some(marker) = self
+            .simplified_marker
+            .as_simplified_marker_tree()
+            .restrict(simplified_environment)
+            .try_to_string()
+        {
             table.insert("marker", value(marker));
         }
 
@@ -5814,13 +5829,16 @@ impl DependencyWire {
     fn unwire(
         self,
         requires_python: &RequiresPython,
+        environment: SimplifiedMarkerTree,
         unambiguous_package_ids: &FxHashMap<PackageName, PackageId>,
     ) -> Result<Dependency, LockError> {
-        let complexified_marker = self.marker.into_marker(requires_python);
+        let mut simplified_marker = self.marker;
+        simplified_marker.and(environment);
+        let complexified_marker = simplified_marker.into_marker(requires_python);
         Ok(Dependency {
             package_id: self.package_id.unwire(unambiguous_package_ids)?,
             extra: self.extra,
-            simplified_marker: self.marker,
+            simplified_marker,
             complexified_marker: UniversalMarker::from_combined(complexified_marker),
         })
     }
@@ -6969,6 +6987,43 @@ fn each_element_on_its_line_array(elements: impl Iterator<Item = impl Into<Value
     array
 }
 
+/// Return the PEP 508 marker space covered by the resolution.
+fn fork_markers_union(
+    fork_markers: &[UniversalMarker],
+    requires_python: &RequiresPython,
+) -> MarkerTree {
+    if fork_markers.is_empty() {
+        return requires_python.to_marker_tree();
+    }
+    let mut environment = MarkerTree::FALSE;
+    for fork_marker in fork_markers {
+        environment.or(fork_marker.pep508());
+    }
+    environment
+}
+
+/// Simplify an edge marker using the PEP 508 conditions that must already hold to reach its parent
+/// node. Parent conflict predicates remain on the edge for compatibility with older lockfile
+/// readers that evaluate dependency markers independently during conflict discovery.
+fn simplify_dependency_marker(
+    requires_python: &RequiresPython,
+    environment: SimplifiedMarkerTree,
+    parent: UniversalMarker,
+    marker: UniversalMarker,
+) -> UniversalMarker {
+    let parent =
+        SimplifiedMarkerTree::new(requires_python, parent.pep508()).as_simplified_marker_tree();
+    let marker =
+        SimplifiedMarkerTree::new(requires_python, marker.combined()).as_simplified_marker_tree();
+    let marker = marker.restrict(parent);
+
+    // Retain the resolution environment internally. The lockfile writer removes it from the wire
+    // marker, and the reader restores it, keeping freshly resolved and deserialized locks equal.
+    let mut marker = SimplifiedMarkerTree::new(requires_python, marker);
+    marker.and(environment);
+    UniversalMarker::from_combined(marker.into_marker(requires_python))
+}
+
 /// Returns the simplified string-ified version of each marker given.
 ///
 /// Note that the marker strings returned will include conflict markers if they
@@ -7254,6 +7309,8 @@ pub(crate) fn is_wheel_unreachable(
 
 #[cfg(test)]
 mod tests {
+    use uv_pep440::VersionSpecifiers;
+    use uv_pep508::MarkerEnvironmentBuilder;
     use uv_warnings::anstream;
 
     use super::*;
@@ -7265,6 +7322,160 @@ mod tests {
             let expr = format!("{}", anstream::adapter::strip_str(&expr));
             insta::assert_snapshot!(expr, @$snapshot);
         }};
+    }
+
+    fn marker_environment() -> MarkerEnvironment {
+        MarkerEnvironment::try_from(MarkerEnvironmentBuilder {
+            implementation_name: "cpython",
+            implementation_version: "3.12.0",
+            os_name: "posix",
+            platform_machine: "arm64",
+            platform_python_implementation: "CPython",
+            platform_release: "23.0.0",
+            platform_system: "Darwin",
+            platform_version: "test",
+            python_full_version: "3.12.0",
+            python_version: "3.12",
+            sys_platform: "darwin",
+        })
+        .expect("valid marker environment")
+    }
+
+    #[test]
+    fn dependency_marker_preserves_parent_conflicts() {
+        let requires_python = RequiresPython::from_specifiers(
+            &VersionSpecifiers::from_str(">=3.12").expect("valid version specifier"),
+        );
+        let parent = UniversalMarker::from_combined(
+            MarkerTree::from_str(
+                "python_full_version >= '3.12' and sys_platform == 'darwin' and extra != 'extra-1-x-foo'",
+            )
+            .expect("valid parent marker"),
+        );
+        let environment = SimplifiedMarkerTree::new(&requires_python, MarkerTree::TRUE);
+
+        let marker = simplify_dependency_marker(&requires_python, environment, parent, parent);
+
+        assert_eq!(
+            marker.combined().try_to_string().as_deref(),
+            Some("python_full_version >= '3.12' and extra != 'extra-1-x-foo'")
+        );
+    }
+
+    #[test]
+    fn dependency_selection_resolves_included_groups_to_same_package() {
+        let lock: Lock = toml::from_str(
+            r#"
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[[package]]
+name = "project"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [{ name = "ty" }]
+
+[package.dependency-groups]
+dev = [{ name = "ty" }]
+typing = [{ name = "ty" }]
+
+[[package]]
+name = "ty"
+version = "1.0.0"
+source = { registry = "https://example.com/simple" }
+"#,
+        )
+        .expect("valid lock");
+        let project_name = PackageName::from_str("project").expect("valid package name");
+        let dependency_name = PackageName::from_str("ty").expect("valid package name");
+        let dev = GroupName::from_str("dev").expect("valid group name");
+        let typing = GroupName::from_str("typing").expect("valid group name");
+        let marker_environment = marker_environment();
+
+        let selection = lock
+            .dependency_selection(Some(&project_name), &dependency_name, &marker_environment)
+            .expect("unique project package");
+        let preferred = selection.group(&dev).expect("dev dependency");
+        let included = selection.group(&typing).expect("typing dependency");
+        let production = selection.production().expect("production dependency");
+
+        assert!(std::ptr::eq(preferred, included));
+        assert!(std::ptr::eq(preferred, production));
+    }
+
+    #[test]
+    fn dependency_selection_resolves_lock_manifest_requirement() {
+        let lock: Lock = toml::from_str(
+            r#"
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[manifest]
+requirements = [{ name = "ty" }]
+
+[[package]]
+name = "ty"
+version = "1.0.0"
+source = { registry = "https://example.com/simple" }
+"#,
+        )
+        .expect("valid lock");
+        let dependency_name = PackageName::from_str("ty").expect("valid package name");
+        let marker_environment = marker_environment();
+
+        let selection = lock
+            .dependency_selection(None, &dependency_name, &marker_environment)
+            .expect("unique root package");
+        let root = selection.root().expect("root dependency");
+
+        assert_eq!(root.name(), &dependency_name);
+        assert!(selection.production().is_none());
+    }
+
+    #[test]
+    fn dependency_selection_returns_any_selection_error() {
+        let lock: Lock = toml::from_str(
+            r#"
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[[package]]
+name = "project"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "ty", version = "1.0.0", source = { registry = "https://example.com/simple" } },
+    { name = "ty", version = "2.0.0", source = { registry = "https://example.com/simple" } },
+]
+
+[package.dependency-groups]
+dev = [
+    { name = "ty", version = "1.0.0", source = { registry = "https://example.com/simple" } },
+]
+
+[[package]]
+name = "ty"
+version = "1.0.0"
+source = { registry = "https://example.com/simple" }
+
+[[package]]
+name = "ty"
+version = "2.0.0"
+source = { registry = "https://example.com/simple" }
+"#,
+        )
+        .expect("valid lock");
+        let project_name = PackageName::from_str("project").expect("valid package name");
+        let dependency_name = PackageName::from_str("ty").expect("valid package name");
+        let marker_environment = marker_environment();
+
+        let error = lock
+            .dependency_selection(Some(&project_name), &dependency_name, &marker_environment)
+            .expect_err("ambiguous production selection");
+        insta::assert_snapshot!(error, @"found multiple packages matching production dependency `ty` for `project`");
     }
 
     #[test]

@@ -3054,6 +3054,8 @@ fn preview_features() {
     +            Check,
     +            PackagedInit,
     +            CentralizedProjectEnvs,
+    +            ToolInstallLocks,
+    +            WorkspaceListScripts,
     +        ],
          },
          python_preference: Managed,

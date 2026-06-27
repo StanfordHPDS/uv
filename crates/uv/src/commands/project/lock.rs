@@ -12,8 +12,8 @@ use tracing::debug;
 use uv_cache::{Cache, Refresh};
 use uv_client::{BaseClientBuilder, FlatIndexClient, RegistryClientBuilder};
 use uv_configuration::{
-    Concurrency, Constraints, DependencyGroupsWithDefaults, DryRun, ExtrasSpecification, Override,
-    PackageOverride, Reinstall, Upgrade,
+    Concurrency, Constraints, DependencyGroupsWithDefaults, DryRun, ExcludeDependency,
+    ExtrasSpecification, Override, PackageOverride, Reinstall, Upgrade,
 };
 use uv_dispatch::BuildDispatch;
 use uv_distribution::{DistributionDatabase, LoweredExtraBuildDependencies};
@@ -1046,7 +1046,7 @@ async fn do_lock(
 }
 
 #[derive(Debug)]
-enum ValidatedLock {
+pub(crate) enum ValidatedLock {
     /// An existing lockfile was provided, but its contents should be ignored.
     Unusable(Lock),
     /// An existing lockfile was provided, and the locked versions should be preferred if possible,
@@ -1061,7 +1061,7 @@ enum ValidatedLock {
 
 impl ValidatedLock {
     /// Validate a [`Lock`] against the workspace requirements.
-    async fn validate<Context: BuildContext>(
+    pub(crate) async fn validate<Context: BuildContext>(
         lock: Lock,
         install_path: &Path,
         packages: &BTreeMap<PackageName, WorkspaceMember>,
@@ -1071,7 +1071,7 @@ impl ValidatedLock {
         dependency_groups: &BTreeMap<GroupName, Vec<Requirement>>,
         constraints: &[Requirement],
         overrides: &[Override<Requirement>],
-        excludes: &[PackageName],
+        excludes: &[ExcludeDependency],
         build_constraints: &[Requirement],
         conflicts: &Conflicts,
         environments: Option<&SupportedEnvironments>,
@@ -1463,9 +1463,21 @@ impl ValidatedLock {
         }
     }
 
+    /// Return whether the existing lock satisfies the current inputs.
+    #[must_use]
+    pub(crate) fn is_satisfied(&self) -> bool {
+        matches!(self, Self::Satisfies(_))
+    }
+
+    /// Return whether the existing lock can provide version preferences.
+    #[must_use]
+    pub(crate) fn is_usable(&self) -> bool {
+        !matches!(self, Self::Unusable(_))
+    }
+
     /// Convert the [`ValidatedLock`] into a [`Lock`].
     #[must_use]
-    fn into_lock(self) -> Lock {
+    pub(crate) fn into_lock(self) -> Lock {
         match self {
             Self::Unusable(lock) => lock,
             Self::Satisfies(lock) => lock,

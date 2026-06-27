@@ -304,6 +304,26 @@ pub(crate) async fn check(
             Err(err) => return Err(err.into()),
         };
 
+        let marker_environment = venv.interpreter().resolver_marker_environment();
+        if ty_path.is_none()
+            && ty_version.is_none()
+            && result
+                .lock()
+                .dependency_selection(
+                    None,
+                    &PackageName::from_str("ty")?,
+                    marker_environment.markers(),
+                )
+                .map_err(anyhow::Error::msg)?
+                .root()
+                .is_some()
+        {
+            locked_ty_path = Some(
+                venv.scripts()
+                    .join(format!("ty{}", std::env::consts::EXE_SUFFIX)),
+            );
+        }
+
         let target = InstallTarget::Script {
             script,
             lock: result.lock(),
@@ -522,7 +542,7 @@ pub(crate) async fn check(
                 )?;
                 project::sync::store_credentials_from_target(target, &client_builder)?;
                 let ty_state = state.fork();
-                let environment = match CachedEnvironment::from_resolution(
+                let environment = match CachedEnvironment::from_locked_resolution(
                     &resolution,
                     result
                         .lock()
