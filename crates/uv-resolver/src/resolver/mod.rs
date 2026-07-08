@@ -59,7 +59,7 @@ use crate::resolution::ResolverOutput;
 use crate::resolution_mode::ResolutionStrategy;
 pub(crate) use crate::resolver::availability::{
     ResolverVersion, UnavailableErrorChain, UnavailablePackage, UnavailableReason,
-    UnavailableVersion,
+    UnavailableVersion, UnsatisfiableRequirement,
 };
 use crate::resolver::batch_prefetch::BatchPrefetcher;
 use crate::resolver::derivation::DerivationChainBuilder;
@@ -1829,16 +1829,12 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     python_requirement,
                 );
 
-                requirements
-                    .flat_map(move |requirement| {
-                        PubGrubDependency::from_requirement(
-                            &self.conflicts,
-                            requirement,
-                            None,
-                            Some(package),
-                        )
-                    })
-                    .collect()
+                PubGrubDependency::from_requirements(
+                    &self.conflicts,
+                    requirements,
+                    None,
+                    Some(package),
+                )
             }
 
             PubGrubPackageInner::Package {
@@ -1960,17 +1956,16 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     python_requirement,
                 );
 
-                requirements
-                    .flat_map(|requirement| {
-                        PubGrubDependency::from_requirement(
-                            &self.conflicts,
-                            requirement,
-                            group.as_ref(),
-                            Some(package),
-                        )
-                    })
-                    .chain(system_dependencies)
-                    .collect()
+                PubGrubDependency::from_requirements(
+                    &self.conflicts,
+                    requirements,
+                    group.as_ref(),
+                    Some(package),
+                )
+                .map(|mut dependencies| {
+                    dependencies.extend(system_dependencies);
+                    dependencies
+                })
             }
 
             PubGrubPackageInner::Python(_) => return Ok(Dependencies::Unforkable(Vec::default())),
@@ -2051,7 +2046,12 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 ));
             }
         };
-        Ok(Dependencies::Available(dependencies))
+        Ok(match dependencies {
+            Ok(dependencies) => Dependencies::Available(dependencies),
+            Err(requirement) => {
+                Dependencies::Unavailable(UnavailableVersion::UnsatisfiableDependency(requirement))
+            }
+        })
     }
 
     /// The regular and dev dependencies filtered by Python version and the markers of this fork,
@@ -3603,19 +3603,19 @@ pub(crate) struct ResolutionPackage {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ResolutionDependencyEdge {
     /// This value is `None` if the dependency comes from the root package.
-    pub(crate) from: Option<PackageName>,
-    pub(crate) from_version: Version,
-    pub(crate) from_url: Option<VerbatimParsedUrl>,
-    pub(crate) from_index: Option<IndexUrl>,
-    pub(crate) from_extra: Option<ExtraName>,
-    pub(crate) from_group: Option<GroupName>,
-    pub(crate) to: PackageName,
-    pub(crate) to_version: Version,
-    pub(crate) to_url: Option<VerbatimParsedUrl>,
-    pub(crate) to_index: Option<IndexUrl>,
-    pub(crate) to_extra: Option<ExtraName>,
-    pub(crate) to_group: Option<GroupName>,
-    pub(crate) marker: MarkerTree,
+    pub(super) from: Option<PackageName>,
+    pub(super) from_version: Version,
+    pub(super) from_url: Option<VerbatimParsedUrl>,
+    pub(super) from_index: Option<IndexUrl>,
+    pub(super) from_extra: Option<ExtraName>,
+    pub(super) from_group: Option<GroupName>,
+    pub(super) to: PackageName,
+    pub(super) to_version: Version,
+    pub(super) to_url: Option<VerbatimParsedUrl>,
+    pub(super) to_index: Option<IndexUrl>,
+    pub(super) to_extra: Option<ExtraName>,
+    pub(super) to_group: Option<GroupName>,
+    pub(super) marker: MarkerTree,
 }
 
 impl ResolutionDependencyEdge {
