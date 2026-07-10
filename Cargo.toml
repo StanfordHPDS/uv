@@ -9,13 +9,14 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.94.0"
+rust-version = "1.95.0"
 homepage = "https://pypi.org/project/uv/"
 repository = "https://github.com/astral-sh/uv"
 authors = ["uv"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+uv = { version = "0.11.28", path = "crates/uv", default-features = false }
 uv-audit = { version = "0.0.61", path = "crates/uv-audit" }
 uv-auth = { version = "0.0.61", path = "crates/uv-auth" }
 uv-bin-install = { version = "0.0.61", path = "crates/uv-bin-install" }

@@ -12,6 +12,17 @@ package = "uv-dev"
 bin = "uv-dev"
 reason = "developer binary shipped from this workspace"
 
+# Keep this list in sync with workspace packages that define doctests.
+
+[[doctest]]
+package = "uv-pep440"
+
+[[doctest]]
+package = "uv-pep508"
+
+[[doctest]]
+package = "uv-redacted"
+
 # Keep public APIs that are consumed by downstream Rust integrations.
 
 [[override]]
@@ -109,14 +120,6 @@ item = "installer::Installer::<'a>::with_installer_name"
 kind = "inherent_method"
 level = "expect"
 reason = "used by Pixi to distinguish packages installed through its uv integration"
-
-[[override]]
-lint = "hawk::unnecessary_public"
-crate = "uv"
-item = "run"
-kind = "function"
-level = "expect"
-reason = "used as a benchmark entrypoint"
 
 # Keep APIs that are consumed by another platform or by non-Rust components.
 
