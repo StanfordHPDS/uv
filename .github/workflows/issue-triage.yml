@@ -4,6 +4,12 @@ name: "issue-triage"
 on:
   issues:
     types: [opened]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "An issue URL or number"
+        required: true
+        type: string
 
 permissions: {}
 
@@ -25,13 +31,13 @@ jobs:
 
       - name: "Collect issue context"
         run: |
-          gh issue view "$ISSUE_NUMBER" \
+          gh issue view "$ISSUE" \
             --repo "$GITHUB_REPOSITORY" \
             --json number,title,body,author \
             > .issue-triage-event.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE: ${{ inputs.issue || github.event.issue.number }}
 
       - name: "Triage issue"
         id: triage
@@ -46,6 +52,18 @@ jobs:
           allow-users: "*"
           prompt-file: "agents/prompts/triage-issue.md"
           output-schema-file: "agents/schemas/issue-triage.json"
+
+  reproduce-bug:
+    needs: triage
+    if: needs.triage.outputs.result != '' && fromJSON(needs.triage.outputs.result).type == 'bug'
+    uses: ./.github/workflows/reproduce-bug.yml
+    secrets: inherit # zizmor: ignore[secrets-inherit] required for the automations environment, as in release.yml
+    with:
+      issue: ${{ inputs.issue || github.event.issue.number }}
+      runner: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
 
   report:
     needs: triage
