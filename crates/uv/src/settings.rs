@@ -1256,12 +1256,14 @@ impl ToolListSettings {
             no_python_downloads: _,
         } = args;
 
-        let filesystem = filesystem
+        let top_level = filesystem
             .map(FilesystemOptions::into_options)
+            .map(|options| options.top_level)
             .unwrap_or_default();
         let filesystem = ResolverInstallerOptions {
-            exclude_newer: filesystem.top_level.exclude_newer,
-            exclude_newer_package: filesystem.top_level.exclude_newer_package,
+            index: top_level.index,
+            exclude_newer: top_level.exclude_newer,
+            exclude_newer_package: top_level.exclude_newer_package,
             ..ResolverInstallerOptions::default()
         };
 
@@ -2965,6 +2967,7 @@ pub(crate) struct CheckSettings {
     pub(crate) ty_path: Option<PathBuf>,
     #[expect(dead_code)]
     script: Option<PathBuf>,
+    pub(crate) fix: bool,
     pub(crate) all_packages: bool,
     pub(crate) package: Vec<PackageName>,
     pub(crate) extras: ExtrasSpecification,
@@ -2991,6 +2994,7 @@ impl CheckSettings {
         environment: EnvironmentOptions,
     ) -> anyhow::Result<Self> {
         let CheckArgs {
+            fix,
             all_packages,
             package,
             script,
@@ -3047,6 +3051,7 @@ impl CheckSettings {
         Ok(Self {
             ty_path: environment.ty_path,
             script,
+            fix,
             all_packages,
             package,
             extras: ExtrasSpecification::from_args(
