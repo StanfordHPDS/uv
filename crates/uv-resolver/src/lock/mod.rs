@@ -61,21 +61,24 @@ use uv_warnings::warn_user_once;
 use uv_workspace::{Editability, WorkspaceMember};
 
 use crate::fork_strategy::ForkStrategy;
+pub use crate::lock::deserialize::Error as CanonicalLockError;
 pub(crate) use crate::lock::export::PylockTomlPackage;
 pub use crate::lock::export::RequirementsTxtExport;
 pub use crate::lock::export::{
     Metadata, PylockToml, PylockTomlError, PylockTomlErrorKind, PythonReport, cyclonedx_json,
 };
-pub use crate::lock::installable::Installable;
+pub use crate::lock::installable::{Installable, InstallableRootKind};
 pub use crate::lock::map::PackageMap;
 pub use crate::lock::tree::{TreeDisplay, TreeJsonTarget};
 use crate::resolution::{AnnotatedDist, ResolutionGraphNode};
 use crate::universal_marker::{ConflictMarker, UniversalMarker};
 use crate::{
     ExcludeNewer, ExcludeNewerOverride, ExcludeNewerPackage, ExcludeNewerSpan, ExcludeNewerValue,
-    InMemoryIndex, MetadataResponse, PrereleaseMode, ResolutionMode, ResolverOutput,
+    InMemoryIndex, MetadataResponse, Prerelease, PrereleaseMode, PrereleasePackage, ResolutionMode,
+    ResolverOutput,
 };
 
+mod deserialize;
 pub(crate) mod export;
 mod installable;
 mod map;
@@ -522,12 +525,7 @@ impl<'a> LockedDependencyBuilder<'a> {
             {
                 // Self-requirements do not create graph edges, but their source and version
                 // constraints must still be satisfied by the locked parent package.
-                if !ExpectedPackageDependencies::package_satisfies_requirement(
-                    expected.package,
-                    expected.package,
-                    requirement,
-                    expected.workspace_root,
-                )? {
+                if !expected.package_satisfies_requirement(expected.package, requirement)? {
                     complete = false;
                 }
                 continue;
@@ -537,12 +535,7 @@ impl<'a> LockedDependencyBuilder<'a> {
 
             let mut covered_marker = MarkerTree::FALSE;
             for dependency in expected.packages_for_name(&requirement.name) {
-                if !ExpectedPackageDependencies::package_satisfies_requirement(
-                    expected.package,
-                    dependency,
-                    requirement,
-                    expected.workspace_root,
-                )? {
+                if !expected.package_satisfies_requirement(dependency, requirement)? {
                     continue;
                 }
 
@@ -656,6 +649,7 @@ struct ExpectedPackageDependencies<'lock> {
     declarations: BTreeSet<Requirement>,
     provides_extra: &'lock [ExtraName],
     dependency_groups: BTreeMap<GroupName, BTreeSet<Requirement>>,
+    constraints: &'lock Constraints,
     activated_extras: BTreeSet<ExtraName>,
     /// The environment under which this package can be selected.
     package_marker: UniversalMarker,
@@ -670,6 +664,7 @@ impl<'lock> ExpectedPackageDependencies<'lock> {
         declarations: &BTreeSet<Requirement>,
         provides_extra: &'lock [ExtraName],
         dependency_groups: &BTreeMap<GroupName, BTreeSet<Requirement>>,
+        constraints: &'lock Constraints,
         overrides: &Overrides,
         excludes: &Excludes,
         package_requires_python: Option<&VersionSpecifiers>,
@@ -729,6 +724,7 @@ impl<'lock> ExpectedPackageDependencies<'lock> {
             declarations,
             provides_extra,
             dependency_groups,
+            constraints,
             activated_extras,
             package_marker,
             lock_marker,
@@ -749,20 +745,42 @@ impl<'lock> ExpectedPackageDependencies<'lock> {
 
     /// Check the resolved source and version once for both generation and existing-edge lookup.
     fn package_satisfies_requirement(
-        parent_package: &Package,
+        &self,
         package: &Package,
         requirement: &Requirement,
-        workspace_root: &Path,
     ) -> Result<bool, LockError> {
-        let source_matches = package
+        let mut source_matches = package
             .id
             .source
-            .satisfies_requirement_source(&requirement.source, workspace_root)?
-            || package.id == parent_package.id
-                && matches!(
-                    requirement.source,
-                    RequirementSource::Registry { index: None, .. }
-                );
+            .satisfies_requirement_source(&requirement.source, self.workspace_root)?;
+
+        // A constraint can select a direct source for an otherwise unqualified registry
+        // requirement. Sources apply globally, even across disjoint marker environments,
+        // but the locked source must still match that constraint exactly.
+        if !source_matches
+            && matches!(
+                requirement.source,
+                RequirementSource::Registry { index: None, .. }
+            )
+            && let Some(constraints) = self.constraints.get(&requirement.name)
+        {
+            for constraint in constraints {
+                if package
+                    .id
+                    .source
+                    .satisfies_requirement_source(&constraint.source, self.workspace_root)?
+                {
+                    source_matches = true;
+                    break;
+                }
+            }
+        }
+
+        source_matches |= package.id == self.package.id
+            && matches!(
+                requirement.source,
+                RequirementSource::Registry { index: None, .. }
+            );
         let version_matches = requirement
             .source
             .version_specifiers()
@@ -1082,7 +1100,7 @@ impl Lock {
 
         let options = ResolverOptions {
             resolution_mode: resolution.options.resolution_mode,
-            prerelease_mode: resolution.options.prerelease_mode,
+            prerelease: resolution.options.prerelease.clone(),
             fork_strategy: resolution.options.fork_strategy,
             exclude_newer: resolution.options.exclude_newer.clone(),
         };
@@ -1374,7 +1392,12 @@ impl Lock {
 
     /// Returns the pre-release mode used to generate this lock.
     pub fn prerelease_mode(&self) -> PrereleaseMode {
-        self.options.prerelease_mode
+        self.options.prerelease.global
+    }
+
+    /// Returns the pre-release policy used to generate this lock.
+    pub fn prerelease(&self) -> &Prerelease {
+        &self.options.prerelease
     }
 
     /// Returns the multi-version mode used to generate this lock.
@@ -1924,6 +1947,25 @@ impl Lock {
         }
     }
 
+    /// Parses a canonical lockfile without falling back to the general TOML parser.
+    ///
+    /// Use [`Self::from_toml`] when reading lockfiles that might not use uv's
+    /// canonical format.
+    pub fn from_canonical_toml(input: &str) -> Result<Self, CanonicalLockError> {
+        deserialize::from_str(input)
+    }
+
+    /// Parses a lockfile, using the canonical fast path when possible.
+    ///
+    /// Lockfiles not written in uv's canonical layout fall back to the general
+    /// TOML parser, preserving its compatibility and error reporting.
+    pub fn from_toml(input: &str) -> Result<Self, toml::de::Error> {
+        match Self::from_canonical_toml(input) {
+            Ok(lock) => Ok(lock),
+            Err(_) => toml::from_str(input),
+        }
+    }
+
     /// Returns the TOML representation of this lockfile.
     pub fn to_toml(&self) -> Result<String, toml_edit::ser::Error> {
         serialize::to_toml(self)
@@ -2019,6 +2061,7 @@ impl Lock {
         requires_dist: Box<[Requirement]>,
         provides_extra: &[ExtraName],
         dependency_groups: BTreeMap<GroupName, Box<[Requirement]>>,
+        constraints: &Constraints,
         overrides: &Overrides,
         excludes: &Excludes,
         package_requires_python: Option<&VersionSpecifiers>,
@@ -2135,6 +2178,7 @@ impl Lock {
                 declarations,
                 provides_extra,
                 &expected_groups,
+                constraints,
                 overrides,
                 excludes,
                 package_requires_python,
@@ -2170,7 +2214,7 @@ impl Lock {
         package: &'lock Package,
         activated_extras: &mut FxHashMap<PackageId, BTreeSet<ExtraName>>,
         missing_metadata: bool,
-        expected: &ExpectedPackageDependencies,
+        expected: &ExpectedPackageDependencies<'_>,
     ) -> Result<SatisfiesResult<'lock>, LockError> {
         // Use the same dependency builder as lockfile construction, including extra
         // activation for packages whose metadata does not need to be regenerated.
@@ -2343,7 +2387,7 @@ impl Lock {
         }
 
         // Validate that the lockfile was generated with the same constraints.
-        {
+        let normalized_constraints = {
             let expected: BTreeSet<_> = constraints
                 .iter()
                 .cloned()
@@ -2359,7 +2403,8 @@ impl Lock {
             if expected != actual {
                 return Ok(SatisfiesResult::MismatchedConstraints(expected, actual));
             }
-        }
+            expected
+        };
 
         // Validate that the lockfile was generated with the same overrides.
         let normalized_overrides = {
@@ -2409,6 +2454,11 @@ impl Lock {
             }
         }
 
+        let dependency_constraints = if allow_missing_package_metadata {
+            Constraints::from_requirements(normalized_constraints.into_iter())
+        } else {
+            Constraints::default()
+        };
         let dependency_overrides = if allow_missing_package_metadata {
             Overrides::from_entries(normalized_overrides.into_iter().collect())
                 .map_err(LockErrorKind::InvalidScopedOverride)?
@@ -2702,6 +2752,7 @@ impl Lock {
                             metadata.requires_dist,
                             &metadata.provides_extra,
                             metadata.dependency_groups,
+                            &dependency_constraints,
                             &dependency_overrides,
                             &dependency_excludes,
                             requires_python.as_ref(),
@@ -2800,6 +2851,7 @@ impl Lock {
                         metadata.requires_dist,
                         &metadata.provides_extra,
                         metadata.dependency_groups,
+                        &dependency_constraints,
                         &dependency_overrides,
                         &dependency_excludes,
                         metadata.requires_python.as_ref(),
@@ -2855,6 +2907,7 @@ impl Lock {
                         metadata.requires_dist,
                         &metadata.provides_extra,
                         metadata.dependency_groups,
+                        &dependency_constraints,
                         &dependency_overrides,
                         &dependency_excludes,
                         requires_python.as_ref(),
@@ -2952,6 +3005,7 @@ impl Lock {
                         metadata.requires_dist,
                         &metadata.provides_extra,
                         metadata.dependency_groups,
+                        &dependency_constraints,
                         &dependency_overrides,
                         &dependency_excludes,
                         metadata.requires_python.as_ref(),
@@ -3196,8 +3250,8 @@ pub enum SatisfiesResult<'lock> {
 struct ResolverOptions {
     /// The [`ResolutionMode`] used to generate this lock.
     resolution_mode: ResolutionMode,
-    /// The [`PrereleaseMode`] used to generate this lock.
-    prerelease_mode: PrereleaseMode,
+    /// The [`Prerelease`] policy used to generate this lock.
+    prerelease: Prerelease,
     /// The [`ForkStrategy`] used to generate this lock.
     fork_strategy: ForkStrategy,
     /// The [`ExcludeNewer`] setting used to generate this lock.
@@ -3211,15 +3265,33 @@ struct ResolverOptionsWire {
     /// The [`ResolutionMode`] used to generate this lock.
     #[serde(default)]
     resolution_mode: ResolutionMode,
-    /// The [`PrereleaseMode`] used to generate this lock.
-    #[serde(default)]
-    prerelease_mode: PrereleaseMode,
+    /// The [`Prerelease`] policy used to generate this lock.
+    #[serde(flatten)]
+    prerelease: PrereleaseWire,
     /// The [`ForkStrategy`] used to generate this lock.
     #[serde(default)]
     fork_strategy: ForkStrategy,
     /// The [`ExcludeNewer`] setting used to generate this lock.
     #[serde(flatten)]
     exclude_newer: ExcludeNewerWire,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct PrereleaseWire {
+    #[serde(default)]
+    prerelease_mode: PrereleaseMode,
+    #[serde(default)]
+    prerelease_package: PrereleasePackage,
+}
+
+impl From<PrereleaseWire> for Prerelease {
+    fn from(wire: PrereleaseWire) -> Self {
+        Self {
+            global: wire.prerelease_mode,
+            package: wire.prerelease_package,
+        }
+    }
 }
 
 #[expect(clippy::struct_field_names)]
@@ -3475,7 +3547,7 @@ impl TryFrom<LockWire> for Lock {
         }
         let options = ResolverOptions {
             resolution_mode: options_wire.resolution_mode,
-            prerelease_mode: options_wire.prerelease_mode,
+            prerelease: options_wire.prerelease.into(),
             fork_strategy: options_wire.fork_strategy,
             exclude_newer: options_wire.exclude_newer.into(),
         };
