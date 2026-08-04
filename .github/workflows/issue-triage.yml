@@ -67,6 +67,7 @@ jobs:
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           codex-home: "agents/codex"
+          effort: high
           permission-profile: "issue-triage"
           safety-strategy: drop-sudo
           allow-users: "*"
@@ -185,8 +186,13 @@ jobs:
           GH_TOKEN: ${{ steps.token.outputs.token }}
 
   reproduce-bug:
-    needs: triage
-    if: needs.triage.outputs.result != '' && fromJSON(needs.triage.outputs.result).type == 'bug'
+    needs: [triage, context]
+    if: >-
+      needs.triage.outputs.result != '' &&
+      (
+        fromJSON(needs.triage.outputs.result).type == 'bug' ||
+        fromJSON(needs.triage.outputs.result).type == 'question'
+      )
     permissions:
       contents: read
       id-token: write
@@ -194,5 +200,6 @@ jobs:
     uses: ./.github/workflows/reproduce-bug.yml
     with:
       issue: ${{ inputs.issue || github.event.issue.number }}
+      issue-type: ${{ fromJSON(needs.triage.outputs.result).type }}
       runner: ubuntu-latest
     secrets: inherit # zizmor: ignore[secrets-inherit] -- protected environment secrets are needed for reproduction

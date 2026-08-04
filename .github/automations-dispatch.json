@@ -12,14 +12,35 @@
   },
   "rules": [
     {
+      "repository": "uv",
+      "on": {
+        "pull_request": ["opened", "reopened"]
+      },
+      "conditions": {
+        "/pull_request/base/ref": "main",
+        "/pull_request/head/repo/full_name": "astral-sh/uv"
+      },
+      "allow_draft": true,
+      "workflow": "pull-request-labels.yml"
+    },
+    {
       "repository": "uv-dev",
       "on": {
-        "pull_request": ["ready_for_review"]
+        "pull_request": ["opened", "reopened"]
       },
-      "workflow": "promote-pull-request.yml",
-      "inputs": {
-        "promoter": "/sender/login"
-      }
+      "conditions": {
+        "/pull_request/base/ref": "main",
+        "/pull_request/head/repo/full_name": "astral-sh/uv-dev"
+      },
+      "allow_draft": true,
+      "workflow": "pull-request-labels.yml"
+    },
+    {
+      "repository": "uv-dev",
+      "on": {
+        "pull_request": ["ready_for_review", "synchronize"]
+      },
+      "workflow": "promote-pull-request.yml"
     },
     {
       "repository": "uv-dev",

@@ -5446,8 +5446,7 @@ enum GitSourceKind {
 }
 
 /// Inspired by: <https://discuss.python.org/t/lock-files-again-but-this-time-w-sdists/46593>
-#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SourceDistMetadata {
     /// A hash of the source distribution.
     hash: Option<Hash>,
@@ -5456,7 +5455,6 @@ struct SourceDistMetadata {
     /// This is only present for source distributions that come from registries.
     size: Option<u64>,
     /// The upload time of the source distribution.
-    #[serde(alias = "upload_time")]
     upload_time: Option<Timestamp>,
 }
 
@@ -5464,23 +5462,60 @@ struct SourceDistMetadata {
 /// locked against was found. The location does not need to exist in the
 /// future, so this should be treated as only a hint to where to look
 /// and/or recording where the source dist file originally came from.
-#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
-#[serde(from = "SourceDistWire")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum SourceDist {
     Url {
         url: UrlString,
-        #[serde(flatten)]
         metadata: SourceDistMetadata,
     },
     Path {
         path: Box<Path>,
-        #[serde(flatten)]
         metadata: SourceDistMetadata,
     },
     Metadata {
-        #[serde(flatten)]
         metadata: SourceDistMetadata,
     },
+}
+
+impl<'de> serde::Deserialize<'de> for SourceDist {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct Fields {
+            url: Option<UrlString>,
+            path: Option<PortablePathBuf>,
+            hash: Option<Hash>,
+            size: Option<u64>,
+            #[serde(alias = "upload_time")]
+            upload_time: Option<Timestamp>,
+        }
+
+        let Fields {
+            url,
+            path,
+            hash,
+            size,
+            upload_time,
+        } = serde::Deserialize::deserialize(deserializer)?;
+
+        let metadata = SourceDistMetadata {
+            hash,
+            size,
+            upload_time,
+        };
+
+        Ok(match (url, path) {
+            (Some(url), _) => Self::Url { url, metadata },
+            (None, Some(path)) => Self::Path {
+                path: path.into(),
+                metadata,
+            },
+            (None, None) => Self::Metadata { metadata },
+        })
+    }
 }
 
 impl SourceDist {
@@ -5738,38 +5773,6 @@ impl SourceDist {
                 upload_time: None,
             },
         })
-    }
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(untagged, rename_all = "kebab-case")]
-enum SourceDistWire {
-    Url {
-        url: UrlString,
-        #[serde(flatten)]
-        metadata: SourceDistMetadata,
-    },
-    Path {
-        path: PortablePathBuf,
-        #[serde(flatten)]
-        metadata: SourceDistMetadata,
-    },
-    Metadata {
-        #[serde(flatten)]
-        metadata: SourceDistMetadata,
-    },
-}
-
-impl From<SourceDistWire> for SourceDist {
-    fn from(wire: SourceDistWire) -> Self {
-        match wire {
-            SourceDistWire::Url { url, metadata } => Self::Url { url, metadata },
-            SourceDistWire::Path { path, metadata } => Self::Path {
-                path: path.into(),
-                metadata,
-            },
-            SourceDistWire::Metadata { metadata } => Self::Metadata { metadata },
-        }
     }
 }
 
@@ -6196,8 +6199,9 @@ impl Wheel {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct WheelWire {
-    #[serde(flatten)]
-    url: WheelWireSource,
+    url: Option<UrlString>,
+    path: Option<Box<Path>>,
+    filename: Option<WheelFilename>,
     /// A hash of the built distribution.
     ///
     /// This is only present for wheels that come from registries and direct
@@ -6248,7 +6252,17 @@ impl TryFrom<WheelWire> for Wheel {
     type Error = String;
 
     fn try_from(wire: WheelWire) -> Result<Self, String> {
-        let filename = match &wire.url {
+        let source = if let Some(url) = wire.url {
+            WheelWireSource::Url { url }
+        } else if let Some(path) = wire.path {
+            WheelWireSource::Path { path }
+        } else if let Some(filename) = wire.filename {
+            WheelWireSource::Filename { filename }
+        } else {
+            return Err("wheel has no URL, path, or filename".to_string());
+        };
+
+        let filename = match &source {
             WheelWireSource::Url { url } => {
                 let filename = url.filename().map_err(|err| err.to_string())?;
                 filename.parse::<WheelFilename>().map_err(|err| {
@@ -6270,7 +6284,7 @@ impl TryFrom<WheelWire> for Wheel {
         };
 
         Ok(Self {
-            url: wire.url,
+            url: source,
             hash: wire.hash,
             size: wire.size,
             upload_time: wire.upload_time,
@@ -8312,6 +8326,21 @@ source = { editable = "path/to/a" }
 "#;
         let result = toml::from_str::<Lock>(data);
         insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn wheel_sources_deserialize() {
+        for source in [
+            r#"url = "https://example.com/dependency-1.0.0-py3-none-any.whl""#,
+            r#"path = "dependency-1.0.0-py3-none-any.whl""#,
+            r#"filename = "dependency-1.0.0-py3-none-any.whl""#,
+        ] {
+            let wheel: Wheel = toml::from_str(source).expect("valid wheel source");
+            assert_eq!(
+                wheel.filename.to_string(),
+                "dependency-1.0.0-py3-none-any.whl"
+            );
+        }
     }
 
     #[test]
