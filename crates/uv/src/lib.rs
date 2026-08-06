@@ -1279,13 +1279,13 @@ pub async fn run(cli: Cli, global_initialization: GlobalInitialization) -> Resul
         })
         | Commands::Clean(args) => {
             show_settings!(args);
-            commands::cache_clean(&args.package, args.force, cache, printer).await
+            commands::cache_clean(&args.package, args.force, cache, printer, globals.preview).await
         }
         Commands::Cache(CacheNamespace {
             command: CacheCommand::Prune(args),
         }) => {
             show_settings!(args);
-            commands::cache_prune(args.ci, args.force, cache, printer).await
+            commands::cache_prune(args.ci, args.force, cache, printer, globals.preview).await
         }
         Commands::Cache(CacheNamespace {
             command: CacheCommand::Dir,
@@ -2366,6 +2366,8 @@ async fn run_project(
                 globals.preview,
                 args.max_recursion_depth,
                 args.malware_settings,
+                #[cfg(unix)]
+                args.run_rlimit_nofile,
             ))
             .await
         }

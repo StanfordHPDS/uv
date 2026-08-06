@@ -30,7 +30,7 @@ jobs:
     runs-on: depot-ubuntu-24.04-16
     name: "cargo test on linux"
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -44,6 +44,7 @@ jobs:
         id: rust-cache
         with:
           prefix-key: v1-rust-workspace
+          key: ${{ hashFiles('Cargo.toml') }}
           cache-workspace-crates: "true"
           save-if: ${{ inputs.save-rust-cache == 'true' }}
 
@@ -53,7 +54,7 @@ jobs:
 
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.33"
+          version: "0.12.1"
 
       - name: "Install required Python versions"
         run: uv python install
@@ -149,7 +150,7 @@ jobs:
     runs-on: namespace-profile-macos-15
     name: "cargo test on macos"
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -160,6 +161,7 @@ jobs:
         id: rust-cache
         with:
           prefix-key: v1-rust-workspace
+          key: ${{ hashFiles('Cargo.toml') }}
           cache-workspace-crates: "true"
           save-if: ${{ inputs.save-rust-cache == 'true' }}
 
@@ -185,7 +187,7 @@ jobs:
 
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.33"
+          version: "0.12.1"
 
       - name: "Install required Python versions"
         run: uv python install
@@ -251,7 +253,7 @@ jobs:
       matrix:
         partition: [1, 2, 3]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -265,7 +267,7 @@ jobs:
 
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.33"
+          version: "0.12.1"
 
       - name: "Install required Python versions"
         run: uv python install
@@ -278,6 +280,7 @@ jobs:
         id: rust-cache
         with:
           prefix-key: v1-rust-workspace
+          key: ${{ hashFiles('Cargo.toml') }}
           workspaces: ${{ env.UV_WORKSPACE }}
           cache-workspace-crates: "true"
           # Use the same cache entry across the partitions
