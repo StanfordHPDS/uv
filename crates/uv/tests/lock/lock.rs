@@ -5856,15 +5856,12 @@ fn lock_requires_python() -> Result<()> {
       × No solution found when resolving dependencies for split (markers: python_full_version >= '3.7' and python_full_version < '3.7.9'):
       ╰─▶ Because the requested Python version (>=3.7) does not satisfy Python>=3.7.9 and pygls>=1.1.0,<=1.2.1 depends on Python>=3.7.9,<4, we can conclude that pygls>=1.1.0,<=1.2.1 cannot be used.
           And because only the following versions of pygls are available:
-              pygls<=1.1.0
-              pygls==1.1.1
-              pygls==1.1.2
-              pygls==1.2.0
-              pygls==1.2.1
-              pygls==1.3.0
+              pygls<=1.2.1
+              pygls>=1.3.0
           we can conclude that pygls>=1.1.0,<1.3.0 cannot be used. (1)
 
           Because the requested Python version (>=3.7) does not satisfy Python>=3.8 and pygls==1.3.0 depends on Python>=3.8, we can conclude that pygls==1.3.0 cannot be used.
+          And because only pygls<=1.3.0 is available, we can conclude that pygls>=1.3.0 cannot be used.
           And because we know from (1) that pygls>=1.1.0,<1.3.0 cannot be used, we can conclude that pygls>=1.1.0 cannot be used.
           And because your project depends on pygls>=1.1.0, we can conclude that your project's requirements are unsatisfiable.
 
@@ -24076,8 +24073,8 @@ fn lock_split_python_environment() -> Result<()> {
         revision = 3
         requires-python = ">=3.7"
         resolution-markers = [
-            "python_full_version < '3.8'",
             "python_full_version >= '3.8'",
+            "python_full_version < '3.8'",
         ]
         supported-markers = [
             "python_full_version < '3.8'",
@@ -24139,6 +24136,257 @@ fn lock_split_python_environment() -> Result<()> {
     ----- stderr -----
     Resolved 2 packages in [TIME]
     ");
+
+    Ok(())
+}
+
+/// Initial environment forks with distinct lower Python bounds should follow the effective fork
+/// scheduling policy, including the precedence of lowest resolution over the fork strategy.
+#[cfg(feature = "test-universal")]
+#[test]
+fn lock_fork_strategy_with_python_environments() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let server = PackseServer::new("fork/fork-strategy-environments.toml");
+
+    // The `requires-python` strategy solves the `3.12` fork first, so each fork gets its own
+    // highest version.
+    let requires_python = context.temp_dir.child("requires-python");
+    requires_python.create_dir_all()?;
+    requires_python
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.11,<3.13"
+        dependencies = [
+            "a<=1.0.0 ; python_version < '3.12'",
+            "a<=2.0.0 ; python_version >= '3.12'",
+        ]
+
+        [tool.uv]
+        fork-strategy = "requires-python"
+        environments = [
+            "python_version == '3.11'",
+            "python_version == '3.12'",
+        ]
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.lock().current_dir(&requires_python).arg("--index-url").arg(server.index_url()), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
+    Resolved 3 packages in [TIME]
+    ");
+
+    insta::with_settings!({
+        filters => context.filters(),
+    }, {
+        assert_snapshot!(context.read("requires-python/uv.lock"), @r#"
+        version = 1
+        revision = 3
+        requires-python = ">=3.11, <3.13"
+        resolution-markers = [
+            "python_full_version >= '3.12'",
+            "python_full_version < '3.12'",
+        ]
+        supported-markers = [
+            "python_full_version < '3.12'",
+            "python_full_version >= '3.12'",
+        ]
+
+        [options]
+        exclude-newer = "2024-03-25T00:00:00Z"
+
+        [[package]]
+        name = "a"
+        version = "1.0.0"
+        source = { registry = "http://[LOCALHOST]/simple/" }
+        resolution-markers = [
+            "python_full_version < '3.12'",
+        ]
+        sdist = { url = "http://[LOCALHOST]/files/a-1.0.0.tar.gz", hash = "sha256:4816d803f3b4985959b41da3ae6da7ae3951b56465a53602dedc92c0c12ca685", upload-time = "2024-03-24T00:00:00Z" }
+        wheels = [
+            { url = "http://[LOCALHOST]/files/a-1.0.0-py3-none-any.whl", hash = "sha256:3569209a9ecaea7636fa3b0ed97d6a9d50fccad1399a7dcf45caad2cbe59ae50", upload-time = "2024-03-24T00:00:00Z" },
+        ]
+
+        [[package]]
+        name = "a"
+        version = "2.0.0"
+        source = { registry = "http://[LOCALHOST]/simple/" }
+        resolution-markers = [
+            "python_full_version >= '3.12'",
+        ]
+        sdist = { url = "http://[LOCALHOST]/files/a-2.0.0.tar.gz", hash = "sha256:0818a47dd4fc0083f2e9dfc1486f9663e79b3c1ec8308803472c32d46a9dfa1c", upload-time = "2024-03-24T00:00:00Z" }
+        wheels = [
+            { url = "http://[LOCALHOST]/files/a-2.0.0-py3-none-any.whl", hash = "sha256:498db1c24445774dde1dddcb558593590642d426a15b384c9f870fa89ddd24b4", upload-time = "2024-03-24T00:00:00Z" },
+        ]
+
+        [[package]]
+        name = "project"
+        version = "0.1.0"
+        source = { virtual = "." }
+        dependencies = [
+            { name = "a", version = "1.0.0", source = { registry = "http://[LOCALHOST]/simple/" }, marker = "python_full_version < '3.12'" },
+            { name = "a", version = "2.0.0", source = { registry = "http://[LOCALHOST]/simple/" }, marker = "python_full_version >= '3.12'" },
+        ]
+
+        [package.metadata]
+        requires-dist = [
+            { name = "a", marker = "python_full_version < '3.12'", specifier = "<=1.0.0" },
+            { name = "a", marker = "python_full_version >= '3.12'", specifier = "<=2.0.0" },
+        ]
+        "#);
+    });
+
+    // The `fewest` strategy solves the `3.11` fork first, and its version carries over to the
+    // `3.12` fork.
+    let fewest = context.temp_dir.child("fewest");
+    fewest.create_dir_all()?;
+    fewest.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.11,<3.13"
+        dependencies = [
+            "a<=1.0.0 ; python_version < '3.12'",
+            "a<=2.0.0 ; python_version >= '3.12'",
+        ]
+
+        [tool.uv]
+        fork-strategy = "fewest"
+        environments = [
+            "python_version == '3.12'",
+            "python_version == '3.11'",
+        ]
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.lock().current_dir(&fewest).arg("--index-url").arg(server.index_url()), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
+    Resolved 2 packages in [TIME]
+    ");
+
+    insta::with_settings!({
+        filters => context.filters(),
+    }, {
+        assert_snapshot!(context.read("fewest/uv.lock"), @r#"
+        version = 1
+        revision = 3
+        requires-python = ">=3.11, <3.13"
+        resolution-markers = [
+            "python_full_version < '3.12'",
+            "python_full_version >= '3.12'",
+        ]
+        supported-markers = [
+            "python_full_version >= '3.12'",
+            "python_full_version < '3.12'",
+        ]
+
+        [options]
+        fork-strategy = "fewest"
+        exclude-newer = "2024-03-25T00:00:00Z"
+
+        [[package]]
+        name = "a"
+        version = "1.0.0"
+        source = { registry = "http://[LOCALHOST]/simple/" }
+        sdist = { url = "http://[LOCALHOST]/files/a-1.0.0.tar.gz", hash = "sha256:4816d803f3b4985959b41da3ae6da7ae3951b56465a53602dedc92c0c12ca685", upload-time = "2024-03-24T00:00:00Z" }
+        wheels = [
+            { url = "http://[LOCALHOST]/files/a-1.0.0-py3-none-any.whl", hash = "sha256:3569209a9ecaea7636fa3b0ed97d6a9d50fccad1399a7dcf45caad2cbe59ae50", upload-time = "2024-03-24T00:00:00Z" },
+        ]
+
+        [[package]]
+        name = "project"
+        version = "0.1.0"
+        source = { virtual = "." }
+        dependencies = [
+            { name = "a" },
+        ]
+
+        [package.metadata]
+        requires-dist = [
+            { name = "a", marker = "python_full_version < '3.12'", specifier = "<=1.0.0" },
+            { name = "a", marker = "python_full_version >= '3.12'", specifier = "<=2.0.0" },
+        ]
+        "#);
+    });
+
+    // The lowest resolution mode takes precedence over the `requires-python` strategy, so the
+    // `3.11` fork is solved first here too.
+    let lowest = context.temp_dir.child("lowest");
+    lowest.create_dir_all()?;
+    lowest.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.11,<3.13"
+        dependencies = [
+            "a==2.0.0 ; python_version < '3.12'",
+            "a>=1.0.0,<=2.0.0 ; python_version >= '3.12'",
+        ]
+
+        [tool.uv]
+        resolution = "lowest"
+        fork-strategy = "requires-python"
+        environments = [
+            "python_version == '3.12'",
+            "python_version == '3.11'",
+        ]
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.lock().current_dir(&lowest).arg("--index-url").arg(server.index_url()), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
+    Resolved 2 packages in [TIME]
+    ");
+
+    insta::with_settings!({
+        filters => context.filters(),
+    }, {
+        assert_snapshot!(context.read("lowest/uv.lock"), @r#"
+        version = 1
+        revision = 3
+        requires-python = ">=3.11, <3.13"
+        resolution-markers = [
+            "python_full_version < '3.12'",
+            "python_full_version >= '3.12'",
+        ]
+        supported-markers = [
+            "python_full_version >= '3.12'",
+            "python_full_version < '3.12'",
+        ]
+
+        [options]
+        resolution-mode = "lowest"
+        exclude-newer = "2024-03-25T00:00:00Z"
+
+        [[package]]
+        name = "a"
+        version = "2.0.0"
+        source = { registry = "http://[LOCALHOST]/simple/" }
+        sdist = { url = "http://[LOCALHOST]/files/a-2.0.0.tar.gz", hash = "sha256:0818a47dd4fc0083f2e9dfc1486f9663e79b3c1ec8308803472c32d46a9dfa1c", upload-time = "2024-03-24T00:00:00Z" }
+        wheels = [
+            { url = "http://[LOCALHOST]/files/a-2.0.0-py3-none-any.whl", hash = "sha256:498db1c24445774dde1dddcb558593590642d426a15b384c9f870fa89ddd24b4", upload-time = "2024-03-24T00:00:00Z" },
+        ]
+
+        [[package]]
+        name = "project"
+        version = "0.1.0"
+        source = { virtual = "." }
+        dependencies = [
+            { name = "a" },
+        ]
+
+        [package.metadata]
+        requires-dist = [
+            { name = "a", marker = "python_full_version < '3.12'", specifier = "==2.0.0" },
+            { name = "a", marker = "python_full_version >= '3.12'", specifier = ">=1.0.0,<=2.0.0" },
+        ]
+        "#);
+    });
 
     Ok(())
 }
@@ -37624,24 +37872,10 @@ fn lock_supported_environment_wheel_only_package_requires_compatible_wheels() ->
     exit_code: 1 (failure)
     ----- stderr -----
       × No solution found when resolving dependencies for split (markers: sys_platform == 'linux'):
-      ╰─▶ Because only the following versions of pywin32 are available:
-              pywin32==222
-              pywin32==223
-              pywin32==224
-              pywin32==225
-              pywin32==226
-              pywin32==227
-              pywin32==228
-              pywin32==300
-              pywin32==301
-              pywin32==302
-              pywin32==303
-              pywin32==304
-              pywin32==305
-              pywin32==306
-              pywin32==307
-              pywin32==308
-          and pywin32<=305 has no wheels with a matching Python version tag (e.g., `cp312`), we can conclude that pywin32<=305 cannot be used.
+      ╰─▶ Because pywin32<=305 has no wheels with a matching Python version tag (e.g., `cp312`) and only the following versions of pywin32 are available:
+              pywin32<=305
+              pywin32>=306
+          we can conclude that pywin32<306 cannot be used.
           And because pywin32>=306 has no Linux-compatible wheels and your project depends on pywin32, we can conclude that your project's requirements are unsatisfiable.
 
     hint: Wheels are available for `pywin32` (v305) with the following Python ABI tags: `cp36m`, `cp37m`, `cp38`, `cp39`, `cp310`, `cp311`
