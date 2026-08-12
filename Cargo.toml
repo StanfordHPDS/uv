@@ -173,6 +173,7 @@ itertools = { version = "0.14.0" }
 jiff = { version = "0.2.0", features = ["serde"] }
 junction = { version = "2.0.0" }
 libc = { version = "0.2.0" }
+linux-raw-sys = { version = "0.12.1", default-features = false, features = ["ioctl"] }
 mailparse = { version = "0.16.0" }
 md-5 = { version = "0.11.0" }
 memchr = { version = "2.7.4" }
@@ -256,6 +257,7 @@ sha2 = { version = "0.11.0" }
 smallvec = { version = "1.13.2" }
 spdx = { version = "0.13.0" }
 syn = { version = "3.0.0" }
+tar-codec = { version = "0.0.13" }
 target-lexicon = { version = "0.13.0" }
 tempfile = { version = "3.14.0" }
 terminal_size = { version = "0.4.2" }
@@ -332,7 +334,7 @@ rcgen = { version = "0.14.5", features = [
   "pem",
   "ring",
 ], default-features = false }
-rustls = { version = "0.23.36", default-features = false }
+rustls = { version = "0.23.36" }
 similar = { version = "3.0.0" }
 webpki = { package = "rustls-webpki", version = "0.103.10" }
 x509-parser = { version = "0.18.0" }

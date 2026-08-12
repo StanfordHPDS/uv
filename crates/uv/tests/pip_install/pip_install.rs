@@ -1,5 +1,4 @@
 use std::fmt::Write;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -18,9 +17,10 @@ use futures::io::AllowStdIo;
 use indoc::{formatdoc, indoc};
 use insta::{allow_duplicates, assert_snapshot};
 use predicates::prelude::predicate;
+use tar_codec::{ArchiveBuilder as _, EntryMetadata, TarEncoder};
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
-use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
+use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use url::Url;
 use walkdir::WalkDir;
 use wiremock::{
@@ -40,23 +40,15 @@ use uv_test::{
 };
 
 fn write_tar_gz(file: File, entries: &[(&str, &str)]) -> Result<()> {
-    let enc = GzEncoder::new(file, flate2::Compression::default());
-    let mut tar = tokio_tar::Builder::new_non_terminated(AllowStdIo::new(enc).compat_write());
+    let mut encoder = GzEncoder::new(file, flate2::Compression::default());
+    let mut tar = TarEncoder::new(AllowStdIo::new(&mut encoder).compat_write()).builder();
 
     for (path, contents) in entries {
-        let mut header = tokio_tar::Header::new_gnu();
-        header.set_size(contents.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        block_on(tar.append_data(
-            &mut header,
-            path,
-            AllowStdIo::new(Cursor::new(contents)).compat(),
-        ))?;
+        block_on(tar.add_file(path, contents.as_bytes(), EntryMetadata::default()))?;
     }
 
-    let writer = block_on(tar.into_inner())?;
-    writer.into_inner().into_inner().finish()?;
+    block_on(tar.finish())?;
+    encoder.finish()?;
     Ok(())
 }
 
@@ -429,6 +421,29 @@ fn missing_find_links() -> Result<()> {
     ----- stderr -----
     error: Failed to read `--find-links` directory: [TEMP_DIR]/missing
       Caused by: [OS ERROR 2]
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn missing_find_links_from_requirements_file() -> Result<()> {
+    let context = uv_test::test_context!("3.12").with_filtered_missing_file_error();
+    let requirements_dir = context.temp_dir.child("requirements");
+    requirements_dir.create_dir_all()?;
+    requirements_dir
+        .child("requirements.txt")
+        .write_str("--find-links ./missing\nflask")?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("-r")
+        .arg("requirements/requirements.txt")
+        .arg("--strict"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Invalid URL in `requirements/requirements.txt` at position 0: `./missing`
+      Caused by: relative URL without a base
     "
     );
 
@@ -7791,6 +7806,37 @@ fn find_links_relative_to_requirements_file() -> Result<()> {
     Ok(())
 }
 
+/// Install from a `--find-links` directory relative to the working directory.
+#[test]
+fn find_links_relative_to_working_directory() -> Result<()> {
+    let context = uv_test::test_context!("3.12").with_filtered_missing_file_error();
+    let links_dir = context.temp_dir.child("links");
+    links_dir.create_dir_all()?;
+    fs::copy(
+        context
+            .workspace_root
+            .join("test/links/ok-1.0.0-py3-none-any.whl"),
+        links_dir.child("ok-1.0.0-py3-none-any.whl").path(),
+    )?;
+    let requirements_dir = context.temp_dir.child("requirements");
+    requirements_dir.create_dir_all()?;
+    requirements_dir
+        .child("requirements.txt")
+        .write_str("--no-index\n--find-links ./links\nok==1.0.0\n")?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("-r")
+        .arg("requirements/requirements.txt"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Invalid URL in `requirements/requirements.txt` at position 11: `./links`
+      Caused by: relative URL without a base
+    "
+    );
+
+    Ok(())
+}
+
 /// Install the latest version across multiple `--find-links` directories.
 #[test]
 fn find_links_multiple() -> Result<()> {
@@ -8068,7 +8114,7 @@ fn require_hashes_build_dependencies() -> Result<()> {
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str(indoc::indoc! {r"
         a==1.0.0 \
-            --hash=sha256:3d2b4c28a4e112f3a1cef1db4dc5efa33fcbbcc38bc11ccc80321097db86c097
+            --hash=sha256:957f99ff1d65ce0d7883d50f4e67ed8d4b42e76d2c2b5e62384ff0ba538647b5
     "})?;
 
     uv_snapshot!(context.pip_install()
