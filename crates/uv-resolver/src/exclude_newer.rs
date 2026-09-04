@@ -1,10 +1,10 @@
 use std::{
+    collections::BTreeMap,
     ops::{Deref, DerefMut},
     str::FromStr,
 };
 
 use jiff::Timestamp;
-use rustc_hash::FxHashMap;
 use serde::ser::SerializeMap;
 use uv_distribution_types::{ExcludeNewerOverride, ExcludeNewerSpan, ExcludeNewerValue};
 use uv_normalize::PackageName;
@@ -163,7 +163,7 @@ fn compare_exclude_newer_value(
                 *span,
             ))
         }
-        (None, None) if this.timestamp() != other.timestamp() => Some(
+        (None, None) if other.timestamp() < this.timestamp() => Some(
             ExcludeNewerValueChange::AbsoluteTimestampChanged(this.timestamp(), other.timestamp()),
         ),
         (Some(_), Some(_)) | (None, None) => None,
@@ -263,7 +263,6 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExcludeNewerOverrideChange {
-    Disabled { was: ExcludeNewerValue },
     Enabled { now: ExcludeNewerValue },
     TimestampChanged(ExcludeNewerValueChange),
 }
@@ -271,7 +270,7 @@ pub enum ExcludeNewerOverrideChange {
 impl ExcludeNewerOverrideChange {
     fn is_relative_timestamp_change(&self) -> bool {
         match self {
-            Self::Disabled { .. } | Self::Enabled { .. } => false,
+            Self::Enabled { .. } => false,
             Self::TimestampChanged(change) => change.is_relative_timestamp_change(),
         }
     }
@@ -280,9 +279,6 @@ impl ExcludeNewerOverrideChange {
 impl std::fmt::Display for ExcludeNewerOverrideChange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Disabled { was } => {
-                write!(f, "add exclude newer exclusion (was `{was}`)")
-            }
             Self::Enabled { now } => {
                 write!(f, "remove exclude newer exclusion (now `{now}`)")
             }
@@ -291,12 +287,15 @@ impl std::fmt::Display for ExcludeNewerOverrideChange {
     }
 }
 
+/// Package-specific `exclude-newer` settings.
+///
+/// Entries are stored in package-name order for deterministic serialization.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-pub struct ExcludeNewerPackage(FxHashMap<PackageName, ExcludeNewerOverride>);
+pub struct ExcludeNewerPackage(BTreeMap<PackageName, ExcludeNewerOverride>);
 
 impl Deref for ExcludeNewerPackage {
-    type Target = FxHashMap<PackageName, ExcludeNewerOverride>;
+    type Target = BTreeMap<PackageName, ExcludeNewerOverride>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -321,7 +320,7 @@ impl FromIterator<ExcludeNewerPackageEntry> for ExcludeNewerPackage {
 
 impl IntoIterator for ExcludeNewerPackage {
     type Item = (PackageName, ExcludeNewerOverride);
-    type IntoIter = std::collections::hash_map::IntoIter<PackageName, ExcludeNewerOverride>;
+    type IntoIter = std::collections::btree_map::IntoIter<PackageName, ExcludeNewerOverride>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
@@ -330,7 +329,7 @@ impl IntoIterator for ExcludeNewerPackage {
 
 impl<'a> IntoIterator for &'a ExcludeNewerPackage {
     type Item = (&'a PackageName, &'a ExcludeNewerOverride);
-    type IntoIter = std::collections::hash_map::Iter<'a, PackageName, ExcludeNewerOverride>;
+    type IntoIter = std::collections::btree_map::Iter<'a, PackageName, ExcludeNewerOverride>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()
@@ -359,17 +358,7 @@ impl ExcludeNewerPackage {
                         ));
                     }
                 }
-                (
-                    ExcludeNewerOverride::Enabled(self_timestamp),
-                    Some(ExcludeNewerOverride::Disabled),
-                ) => {
-                    return Some(ExcludeNewerPackageChange::PackageChanged(
-                        package.clone(),
-                        Box::new(ExcludeNewerOverrideChange::Disabled {
-                            was: self_timestamp.as_ref().clone(),
-                        }),
-                    ));
-                }
+                (ExcludeNewerOverride::Enabled(_), Some(ExcludeNewerOverride::Disabled)) => {}
                 (
                     ExcludeNewerOverride::Disabled,
                     Some(ExcludeNewerOverride::Enabled(other_timestamp)),
@@ -389,7 +378,9 @@ impl ExcludeNewerPackage {
         }
 
         for (package, value) in other {
-            if !self.contains_key(package) {
+            if !self.contains_key(package)
+                && let ExcludeNewerOverride::Enabled(_) = value
+            {
                 return Some(ExcludeNewerPackageChange::PackageAdded(
                     package.clone(),
                     value.clone(),
@@ -409,7 +400,7 @@ pub struct ExcludeNewer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global: Option<ExcludeNewerValue>,
     /// Per-package timestamps that override the global timestamp.
-    #[serde(default, skip_serializing_if = "FxHashMap::is_empty")]
+    #[serde(default, skip_serializing_if = "ExcludeNewerPackage::is_empty")]
     pub package: ExcludeNewerPackage,
 }
 
@@ -499,6 +490,10 @@ impl ExcludeNewer {
         self.global.is_none() && self.package.is_empty()
     }
 
+    /// Compare against current configuration when deciding whether a lockfile may be reused.
+    ///
+    /// A later absolute timestamp permits every artifact in an existing lockfile, so it does not
+    /// invalidate that lockfile. It will be recorded when another change triggers a resolution.
     pub fn compare(&self, other: &Self) -> Option<ExcludeNewerChange> {
         match (&self.global, &other.global) {
             (Some(self_global), Some(other_global)) => {
