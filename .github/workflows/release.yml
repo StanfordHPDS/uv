@@ -56,13 +56,13 @@ jobs:
   release-gate:
     # N.B. This name should not change, it is used for downstream checks.
     name: release-gate
-    if: ${{ inputs.tag != 'dry-run' }}
     runs-on: ubuntu-latest
     # This environment requires a 2-factor approval, i.e., the workflow must be approved by another
     # team member. GitHub fires approval events on every job that deploys to an environment, so we
     # have a dedicated environment for this purpose instead of using the `release` environment.
     # We use a GitHub App with a deployment protection rule webhook to ensure that the `release`
-    # environment is only approved when the `release-gate` job succeeds.
+    # environment is only approved when the `release-gate` job succeeds. Dry-runs also require
+    # approval because they use the real signing keys.
     environment:
       name: release-gate
       deployment: true
@@ -133,6 +133,17 @@ jobs:
       "id-token": "write"
       "packages": "write"
 
+  sign-release-binaries:
+    needs:
+      - build-release-binaries
+      - release-gate
+    if: ${{ inputs.tag == 'dry-run' && github.repository == 'astral-sh/uv' && github.ref == 'refs/heads/main' }}
+    uses: $/.github/workflows/sign-release-binaries.yml
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+
   generate-checksum-manifest:
     needs:
       - plan
@@ -160,7 +171,11 @@ jobs:
           TAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
           temp_manifest=target/local-dist-manifest.json.tmp
-          uv run --only-dev dist manifest "$TAG" --output-format=json --no-local-paths --artifacts=local > "$temp_manifest"
+          tag_args=()
+          if [[ -n "$TAG" ]]; then
+            tag_args=("$TAG")
+          fi
+          uv run --only-dev dist manifest "${tag_args[@]}" --output-format=json --no-local-paths --artifacts=local > "$temp_manifest"
           python3 scripts/patch-dist-manifest-checksums.py --manifest "$temp_manifest" --artifacts-dir target/distrib
           mv "$temp_manifest" target/distrib/local-dist-manifest.json
       - name: Upload synthesized local dist manifest
