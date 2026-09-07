@@ -37,7 +37,7 @@ jobs:
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "0.12.7"
+          version: "0.12.10"
 
       - name: "Install Codex Security plugin"
         run: ./agents/scripts/install-codex-security.sh
@@ -83,7 +83,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}/codex-security
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          codex-version: "0.146.0"
+          codex-version: "0.147.0"
           codex-home: "agents/codex"
           effort: high
           permission-profile: "pull-request-review"
@@ -116,7 +116,7 @@ jobs:
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "0.12.7"
+          version: "0.12.10"
 
       - name: "Prepare review findings"
         id: comments
