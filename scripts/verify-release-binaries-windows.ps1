@@ -15,9 +15,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+$architecture = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'x64' }
+$signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\$architecture\signtool.exe" |
     Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
 if (-not $signtool) { throw 'signtool.exe not found in Windows SDK' }
+
+$found = @(Get-ChildItem $BinaryDirectory -Force | Select-Object -ExpandProperty Name)
+if ($found.Count -ne $Binaries.Count -or @($found | Where-Object { $_ -notin $Binaries }).Count -ne 0) {
+    throw "Unexpected packaged executables: $($found -join ', ')"
+}
 
 foreach ($binary in $Binaries) {
     $binaryPath = (Get-Item "$BinaryDirectory/$binary").FullName
