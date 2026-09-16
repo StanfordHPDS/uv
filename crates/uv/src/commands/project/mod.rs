@@ -12,11 +12,11 @@ use uv_audit::{Dependency, VulnerabilityID};
 use uv_auth::{CredentialsCache, CredentialsFromUrlError};
 use uv_cache::{Cache, CacheBucket};
 use uv_cache_key::{cache_digest, cache_name};
-use uv_client::{BaseClientBuilder, FlatIndexClient, RegistryClientBuilder};
+use uv_client::{BaseClientBuilder, RegistryClientBuilder};
 use uv_configuration::{
     ActiveEnvironment, Concurrency, Constraints, DependencyGroupsWithDefaults, DryRun,
-    ExtrasSpecification, GitLfsSetting, Override, PackageOverride, Reinstall, TargetTriple,
-    Upgrade,
+    ExtrasSpecification, GitLfsSetting, HashCheckingMode, Override, PackageOverride, Reinstall,
+    TargetTriple, Upgrade,
 };
 use uv_dispatch::{BuildDispatch, SharedState};
 use uv_distribution::{DistributionDatabase, LoweredExtraBuildDependencies, LoweredRequirement};
@@ -28,7 +28,7 @@ use uv_distribution_types::{
 use uv_fs::{CWD, LockedFile, LockedFileError, LockedFileMode, Simplified, verbatim_path};
 use uv_git::ResolvedRepositoryReference;
 use uv_installer::{InstallationStrategy, SatisfiesResult, SitePackages};
-use uv_normalize::{DEV_DEPENDENCIES, DefaultGroups, ExtraName, GroupName, PackageName};
+use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pep440::{TildeVersionSpecifier, Version, VersionSpecifiers};
 use uv_pep508::MarkerTreeContents;
 use uv_preview::{Preview, PreviewFeature};
@@ -55,7 +55,7 @@ use uv_torch::TorchStrategy;
 use uv_types::{BuildIsolation, EmptyInstalledPackages, HashStrategy, SourceTreeEditablePolicy};
 use uv_warnings::{warn_user, warn_user_once};
 use uv_workspace::dependency_groups::DependencyGroupError;
-use uv_workspace::pyproject::{ExtraBuildDependency, PyProjectToml};
+use uv_workspace::pyproject::ExtraBuildDependency;
 use uv_workspace::{ProjectEnvironmentSelection, RequiresPythonSources, Workspace, WorkspaceCache};
 
 use crate::commands::pip::loggers::{InstallLogger, ResolveLogger};
@@ -210,11 +210,6 @@ pub(crate) enum ProjectError {
     #[error("PEP 723 scripts do not support dependency groups, but group `{0}` was specified")]
     MissingGroupScript(GroupName),
 
-    #[error(
-        "Default group `{0}` (from `tool.uv.default-groups`) is not defined in the project's `dependency-groups` table"
-    )]
-    MissingDefaultGroup(GroupName),
-
     #[error("Extra `{0}` is not defined in the `optional-dependencies` table for `{1}`")]
     MissingExtraProject(ExtraName, PackageName),
 
@@ -332,6 +327,9 @@ pub(crate) enum ProjectError {
 
     #[error(transparent)]
     Workspace(#[from] uv_workspace::WorkspaceError),
+
+    #[error(transparent)]
+    DefaultGroups(#[from] uv_workspace::DefaultGroupsError),
 
     #[error(transparent)]
     PyprojectMut(#[from] uv_workspace::pyproject_mut::Error),
@@ -2283,6 +2281,7 @@ pub(crate) async fn resolve_names(
     requirements: Vec<UnresolvedRequirementSpecification>,
     interpreter: &Interpreter,
     settings: &ResolverInstallerSettings,
+    build_constraints: &Constraints,
     client_builder: &BaseClientBuilder<'_>,
     state: &SharedState,
     concurrency: &Concurrency,
@@ -2381,9 +2380,14 @@ pub(crate) async fn resolve_names(
     // TODO(charlie): These are all default values. We should consider whether we want to make them
     // optional on the downstream APIs.
     let hasher = HashStrategy::default();
-    let flat_index = FlatIndex::default();
-    let build_constraints = Constraints::default();
-    let build_hasher = HashStrategy::default();
+    let build_hasher = HashStrategy::from_constraints(
+        build_constraints,
+        Some(&interpreter.to_resolver_marker_environment()),
+        HashCheckingMode::Verify,
+    )?;
+    let flat_index = FlatIndex::load(&client, cache, index_locations)
+        .await
+        .map_err(Box::new)?;
 
     // Lower the extra build dependencies, if any.
     let extra_build_requires =
@@ -2394,7 +2398,7 @@ pub(crate) async fn resolve_names(
     let build_dispatch = BuildDispatch::new(
         &client,
         cache,
-        &build_constraints,
+        build_constraints,
         interpreter,
         index_locations,
         &flat_index,
@@ -2619,7 +2623,11 @@ pub(crate) async fn resolve_environment(
         EnvironmentResolution::Specific => HashStrategy::default(),
         EnvironmentResolution::Universal => HashStrategy::collect(HashCollection::Url),
     };
-    let build_hasher = HashStrategy::default();
+    let build_hasher = HashStrategy::from_constraints(
+        &build_constraints,
+        Some(&interpreter.to_resolver_marker_environment()),
+        HashCheckingMode::Verify,
+    )?;
 
     // When resolving from an interpreter, we assume an empty environment, so reinstalls aren't
     // relevant. Upgrades are only relevant for universal resolutions that use an existing lock as
@@ -2649,13 +2657,7 @@ pub(crate) async fn resolve_environment(
     };
 
     // Resolve the flat indexes from `--find-links`.
-    let flat_index = {
-        let client = FlatIndexClient::new(client.cached_client(), client.connectivity(), cache);
-        let entries = client
-            .fetch_all(index_locations.flat_indexes().map(Index::url))
-            .await?;
-        FlatIndex::from_entries(entries)
-    };
+    let flat_index = FlatIndex::load(&client, cache, index_locations).await?;
 
     // Lower the extra build dependencies, if any.
     let extra_build_requires =
@@ -2784,20 +2786,18 @@ pub(crate) async fn sync_environment(
         }
     };
 
+    let build_hasher = HashStrategy::from_constraints(
+        &build_constraints,
+        Some(&interpreter.to_resolver_marker_environment()),
+        HashCheckingMode::Verify,
+    )?;
     // TODO(charlie): These are all default values. We should consider whether we want to make them
     // optional on the downstream APIs.
-    let build_hasher = HashStrategy::default();
     let dry_run = DryRun::default();
     let workspace_cache = WorkspaceCache::default();
 
     // Resolve the flat indexes from `--find-links`.
-    let flat_index = {
-        let client = FlatIndexClient::new(client.cached_client(), client.connectivity(), cache);
-        let entries = client
-            .fetch_all(index_locations.flat_indexes().map(Index::url))
-            .await?;
-        FlatIndex::from_entries(entries)
-    };
+    let flat_index = FlatIndex::load(&client, cache, index_locations).await?;
 
     // Lower the extra build dependencies, if any.
     let extra_build_requires =
@@ -3042,9 +3042,13 @@ pub(crate) async fn update_environment(
         .build_options(build_options.clone())
         .build();
 
+    let build_hasher = HashStrategy::from_constraints(
+        &build_constraints,
+        Some(&interpreter.to_resolver_marker_environment()),
+        HashCheckingMode::Verify,
+    )?;
     // TODO(charlie): These are all default values. We should consider whether we want to make them
     // optional on the downstream APIs.
-    let build_hasher = HashStrategy::default();
     let extras = ExtrasSpecification::default();
     let groups = BTreeMap::new();
     let hasher = HashStrategy::default();
@@ -3054,13 +3058,7 @@ pub(crate) async fn update_environment(
     let python_requirement = PythonRequirement::from_interpreter(interpreter);
 
     // Resolve the flat indexes from `--find-links`.
-    let flat_index = {
-        let client = FlatIndexClient::new(client.cached_client(), client.connectivity(), cache);
-        let entries = client
-            .fetch_all(index_locations.flat_indexes().map(Index::url))
-            .await?;
-        FlatIndex::from_entries(entries)
-    };
+    let flat_index = FlatIndex::load(&client, cache, index_locations).await?;
 
     // Create a build dispatch.
     let build_dispatch = BuildDispatch::new(
@@ -3210,32 +3208,6 @@ pub(crate) async fn init_script_python_requirement(
     Ok(RequiresPython::greater_than_equal_version(
         &interpreter.python_minor_version(),
     ))
-}
-
-/// Returns the default dependency groups from the [`PyProjectToml`].
-pub(crate) fn default_dependency_groups(
-    pyproject_toml: &PyProjectToml,
-) -> Result<DefaultGroups, ProjectError> {
-    if let Some(defaults) = pyproject_toml
-        .tool
-        .as_ref()
-        .and_then(|tool| tool.uv.as_ref().and_then(|uv| uv.default_groups.as_ref()))
-    {
-        if let DefaultGroups::List(defaults) = defaults {
-            for group in defaults {
-                if !pyproject_toml
-                    .dependency_groups
-                    .as_ref()
-                    .is_some_and(|groups| groups.contains_key(group))
-                {
-                    return Err(ProjectError::MissingDefaultGroup(group.clone()));
-                }
-            }
-        }
-        Ok(defaults.clone())
-    } else {
-        Ok(DefaultGroups::List(vec![DEV_DEPENDENCIES.clone()]))
-    }
 }
 
 /// Validate that we aren't trying to install extras or groups that

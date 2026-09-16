@@ -14,11 +14,11 @@ use tracing::{debug, warn};
 
 use uv_cache::Cache;
 use uv_cache_key::RepositoryUrl;
-use uv_client::{BaseClientBuilder, FlatIndexClient, RegistryClientBuilder};
+use uv_client::{BaseClientBuilder, RegistryClientBuilder};
 use uv_configuration::{
-    ActiveEnvironment, Concurrency, Constraints, DependencyGroups, DependencyGroupsWithDefaults,
-    DevMode, DryRun, EditableMode, ExtrasSpecification, ExtrasSpecificationWithDefaults,
-    GitLfsSetting, InstallOptions, NoSources,
+    ActiveEnvironment, Concurrency, DependencyGroups, DependencyGroupsWithDefaults, DevMode,
+    DryRun, EditableMode, ExtrasSpecification, ExtrasSpecificationWithDefaults, GitLfsSetting,
+    InstallOptions, NoSources,
 };
 use uv_dispatch::BuildDispatch;
 use uv_distribution::{DistributionDatabase, LoweredExtraBuildDependencies};
@@ -60,7 +60,7 @@ use crate::commands::project::lock_target::LockTarget;
 use crate::commands::project::{
     LinkErrorReporting, PlatformState, ProjectEnvironment, ProjectEnvironmentPolicy, ProjectError,
     ProjectInterpreter, ScriptInterpreter, UniversalState, WorkspacePython,
-    default_dependency_groups, init_script_python_requirement,
+    init_script_python_requirement,
 };
 use crate::commands::reporters::{PythonDownloadReporter, ResolverReporter};
 use crate::commands::{ExitStatus, ScriptPath, UvError, project};
@@ -303,8 +303,7 @@ pub(crate) async fn add(
         }
 
         // Enable the default groups of the project
-        defaulted_groups =
-            groups.with_defaults(default_dependency_groups(project.pyproject_toml())?);
+        defaulted_groups = groups.with_defaults(project.default_groups()?);
 
         if frozen.is_some() || no_sync {
             // Discover the interpreter.
@@ -414,8 +413,6 @@ pub(crate) async fn add(
         if !unnamed.is_empty() {
             // TODO(charlie): These are all default values. We should consider whether we want to
             // make them optional on the downstream APIs.
-            let build_constraints = Constraints::default();
-            let build_hasher = HashStrategy::default();
             let hasher = HashStrategy::default();
             let sources = NoSources::None;
 
@@ -427,6 +424,20 @@ pub(crate) async fn add(
                 .platform(target.interpreter().platform())
                 .build()?;
 
+            let build_constraints = LockTarget::from(&target)
+                .lower_build_constraints(
+                    &settings.resolver.index_locations,
+                    &settings.resolver.sources,
+                    cache,
+                    &WorkspaceCache::default(),
+                    client.credentials_cache(),
+                )
+                .await?;
+            let build_hasher = HashStrategy::from_constraints(
+                &build_constraints,
+                Some(&target.interpreter().to_resolver_marker_environment()),
+                uv_configuration::HashCheckingMode::Verify,
+            )?;
             // Determine whether to enable build isolation.
             let environment;
             let build_isolation = match &settings.resolver.build_isolation {
@@ -442,20 +453,8 @@ pub(crate) async fn add(
             };
 
             // Resolve the flat indexes from `--find-links`.
-            let flat_index = {
-                let client =
-                    FlatIndexClient::new(client.cached_client(), client.connectivity(), cache);
-                let entries = client
-                    .fetch_all(
-                        settings
-                            .resolver
-                            .index_locations
-                            .flat_indexes()
-                            .map(Index::url),
-                    )
-                    .await?;
-                FlatIndex::from_entries(entries)
-            };
+            let flat_index =
+                FlatIndex::load(&client, cache, &settings.resolver.index_locations).await?;
 
             // Lower the extra build dependencies, if any.
             let extra_build_requires = if let AddTarget::Project(project, _) = &target {
@@ -1216,6 +1215,7 @@ async fn lock_and_sync(
                     .expect("project root is a valid URL");
                 let distribution_id = url.distribution_id();
                 let existing = lock_state.index().distributions().remove(&distribution_id);
+                // TODO: Allow an absent entry after reusing a metadata-free lock.
                 debug_assert!(existing.is_some(), "distribution should exist");
             }
 

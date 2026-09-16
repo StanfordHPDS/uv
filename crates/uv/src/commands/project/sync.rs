@@ -12,7 +12,7 @@ use uv_audit::Dependency;
 use uv_audit::osv::{self, Filter};
 use uv_cache::Cache;
 use uv_cli::SyncFormat;
-use uv_client::{BaseClientBuilder, CachedClient, FlatIndexClient, RegistryClientBuilder};
+use uv_client::{BaseClientBuilder, CachedClient, RegistryClientBuilder};
 use uv_configuration::{
     ActiveEnvironment, Concurrency, Constraints, DependencyGroups, DependencyGroupsWithDefaults,
     DryRun, EditableMode, ExtrasSpecification, ExtrasSpecificationWithDefaults, HashCheckingMode,
@@ -21,7 +21,7 @@ use uv_configuration::{
 use uv_dispatch::BuildDispatch;
 use uv_distribution::LoweredExtraBuildDependencies;
 use uv_distribution_types::{
-    Dist, Index, IndexUrl, Name, Requirement, Resolution, ResolvedDist, SourceDist,
+    Dist, IndexUrl, Name, NameRequirementSpecification, Resolution, ResolvedDist, SourceDist,
 };
 use uv_fs::{PortablePathBuf, Simplified};
 use uv_installer::{InstallationStrategy, SitePackages};
@@ -53,8 +53,8 @@ use crate::commands::project::lock::{LockMode, LockOperation, LockResult};
 use crate::commands::project::lock_target::LockTarget;
 use crate::commands::project::{
     EnvironmentUpdate, LinkErrorReporting, MalwareFindings, PlatformState, ProjectEnvironment,
-    ProjectError, ScriptEnvironment, UniversalState, default_dependency_groups, detect_conflicts,
-    script_extra_build_requires, script_specification, update_environment,
+    ProjectError, ScriptEnvironment, UniversalState, detect_conflicts, script_extra_build_requires,
+    script_specification, update_environment,
 };
 use crate::commands::{ExitStatus, UvError};
 use crate::printer::Printer;
@@ -150,7 +150,7 @@ pub(crate) async fn sync(
 
     // Determine the groups and extras to include.
     let default_groups = match &target {
-        SyncTarget::Project(project) => default_dependency_groups(project.pyproject_toml())?,
+        SyncTarget::Project(project) => project.default_groups()?,
         SyncTarget::Script(..) => DefaultGroups::default(),
     };
     let default_extras = match &target {
@@ -271,10 +271,11 @@ pub(crate) async fn sync(
                         .and_then(|uv| uv.build_constraint_dependencies.as_ref())
                 })
                 .map(|constraints| {
-                    Constraints::from_requirements(
+                    Constraints::from_specifications(
                         constraints
                             .iter()
-                            .map(|constraint| Requirement::from(constraint.clone())),
+                            .cloned()
+                            .map(NameRequirementSpecification::from),
                     )
                 });
 
@@ -860,17 +861,19 @@ pub(crate) async fn do_sync<'a>(
     // Read the build constraints from the lockfile.
     let build_constraints = target.build_constraints();
 
-    // Verify build dependencies against the full lockfile, including unselected extras and groups.
-    let build_hasher = target.lock().hash_strategy(target.install_path())?;
+    let build_hasher = HashStrategy::from_constraints(
+        &build_constraints,
+        Some(&venv.interpreter().to_resolver_marker_environment()),
+        uv_configuration::HashCheckingMode::Verify,
+    )?;
+    // Also verify artifacts in the full lockfile, including unselected extras and groups.
+    let build_hasher = target
+        .lock()
+        .hash_strategy(target.install_path())?
+        .with_constraint_hashes(&build_hasher)?;
 
     // Resolve the flat indexes from `--find-links`.
-    let flat_index = {
-        let client = FlatIndexClient::new(client.cached_client(), client.connectivity(), cache);
-        let entries = client
-            .fetch_all(index_locations.flat_indexes().map(Index::url))
-            .await?;
-        FlatIndex::from_entries(entries)
-    };
+    let flat_index = FlatIndex::load(&client, cache, index_locations).await?;
 
     // Create a build dispatch.
     let build_dispatch = BuildDispatch::new(

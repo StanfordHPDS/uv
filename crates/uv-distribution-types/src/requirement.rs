@@ -83,10 +83,22 @@ impl Requirement {
 
     /// Convert to a [`Requirement`] with an absolute path based on the given root.
     #[must_use]
-    pub fn to_absolute(self, path: &Path) -> Self {
+    pub(crate) fn into_absolute(self, path: &Path) -> Self {
         Self {
             source: self.source.into_absolute(path),
             ..self
+        }
+    }
+
+    /// Set whether this requirement's local source should be represented by a relative path.
+    ///
+    /// When `false`, preserve the original input's path preference. Non-local sources are unchanged.
+    pub fn set_force_relative(&mut self, force_relative: bool) {
+        if let RequirementSource::Path { url, .. } | RequirementSource::Directory { url, .. } =
+            &mut self.source
+            && url.force_relative() != force_relative
+        {
+            *url = url.clone().with_force_relative(force_relative);
         }
     }
 
@@ -747,7 +759,7 @@ impl RequirementSource {
                 ext,
                 url,
             } => Ok(Self::Path {
-                install_path: try_relative_to_if(&install_path, path, !url.was_given_absolute())?
+                install_path: try_relative_to_if(&install_path, path, url.prefers_relative())?
                     .into_boxed_path(),
                 ext,
                 url,
@@ -759,7 +771,7 @@ impl RequirementSource {
                 url,
                 ..
             } => Ok(Self::Directory {
-                install_path: try_relative_to_if(&install_path, path, !url.was_given_absolute())?
+                install_path: try_relative_to_if(&install_path, path, url.prefers_relative())?
                     .into_boxed_path(),
                 editable,
                 r#virtual,

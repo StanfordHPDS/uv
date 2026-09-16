@@ -12,18 +12,18 @@ use owo_colors::OwoColorize;
 use thiserror::Error;
 use tracing::{debug, warn};
 use uv_cache::{Cache, Refresh};
-use uv_client::{BaseClientBuilder, FlatIndexClient, RegistryClientBuilder};
+use uv_client::{BaseClientBuilder, RegistryClientBuilder};
 use uv_configuration::{
     BuildOptions, Concurrency, Constraints, DependencyGroupsWithDefaults, ExcludeDependency,
-    ExtrasSpecification, GitLfsSetting, InstallOptions, Override, TargetTriple,
+    ExtrasSpecification, GitLfsSetting, HashCheckingMode, InstallOptions, Override, TargetTriple,
 };
 use uv_dispatch::BuildDispatch;
 use uv_distribution::{
     DistributionDatabase, LoweredExtraBuildDependencies, StaticMetadataDatabase,
 };
 use uv_distribution_types::{
-    DependencyMetadata, HashCollection, Index, IndexLocations, InstalledDist, Name, Requirement,
-    RequiresPython, Resolution, UnresolvedRequirement,
+    DependencyMetadata, HashCollection, IndexLocations, InstalledDist, Name,
+    NameRequirementSpecification, Requirement, RequiresPython, Resolution, UnresolvedRequirement,
 };
 use uv_errors::{ErrorWithHints, Hinted, Hints};
 #[cfg(unix)]
@@ -316,7 +316,7 @@ impl ToolLock {
         constraints: &[Requirement],
         overrides: &[Requirement],
         excludes: &[ExcludeDependency],
-        build_constraints: &[Requirement],
+        build_constraints: &[NameRequirementSpecification],
         dependency_metadata: &DependencyMetadata,
     ) -> ResolverManifest {
         ResolverManifest::new(
@@ -339,7 +339,14 @@ impl ToolLock {
         index_locations: &IndexLocations,
     ) -> anyhow::Result<Self> {
         let manifest = manifest.clone().relative_to(root)?;
-        let lock = Lock::from_resolution(resolution, manifest, root, Vec::new(), index_locations)?;
+        let lock = Lock::from_resolution(
+            resolution,
+            manifest,
+            root,
+            Vec::new(),
+            index_locations,
+            false,
+        )?;
         Ok(Self {
             root: root.to_path_buf(),
             lock,
@@ -397,7 +404,7 @@ impl ToolLock {
         constraints: &[Requirement],
         overrides: &[Requirement],
         excludes: &[ExcludeDependency],
-        build_constraints: &[Requirement],
+        build_constraints: &Constraints,
         refresh: &Refresh,
         interpreter: &Interpreter,
         settings: &ResolverSettings,
@@ -464,25 +471,21 @@ impl ToolLock {
             .build_options(build_options.clone())
             .build();
         let hasher = HashStrategy::collect(HashCollection::Url);
-        let build_hasher = HashStrategy::default();
+        let build_hasher = HashStrategy::from_constraints(
+            build_constraints,
+            Some(&interpreter.to_resolver_marker_environment()),
+            HashCheckingMode::Verify,
+        )?;
 
-        let flat_index = {
-            let client = FlatIndexClient::new(client.cached_client(), client.connectivity(), cache);
-            let entries = client
-                .fetch_all(index_locations.flat_indexes().map(Index::url))
-                .await?;
-            FlatIndex::from_entries(entries)
-        };
+        let flat_index = FlatIndex::load(&client, cache, index_locations).await?;
 
         let extra_build_requires =
             LoweredExtraBuildDependencies::from_non_lowered(extra_build_dependencies.clone())
                 .into_inner();
-        let dispatch_constraints =
-            Constraints::from_requirements(build_constraints.iter().cloned());
         let build_dispatch = BuildDispatch::new(
             &client,
             cache,
-            &dispatch_constraints,
+            build_constraints,
             interpreter,
             index_locations,
             &flat_index,
@@ -740,7 +743,7 @@ pub(crate) fn finalize_tool_install(
     constraints: Vec<Requirement>,
     overrides: Vec<Requirement>,
     excludes: Vec<ExcludeDependency>,
-    build_constraints: Vec<Requirement>,
+    build_constraints: Vec<NameRequirementSpecification>,
     lock: Option<&ToolLock>,
     printer: Printer,
 ) -> anyhow::Result<()> {

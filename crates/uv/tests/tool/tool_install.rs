@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 #[cfg(any(feature = "test-git", feature = "test-git-lfs"))]
 use std::collections::BTreeSet;
 #[cfg(feature = "test-git")]
@@ -10,16 +11,20 @@ use assert_cmd::assert::OutputAssertExt;
 use assert_fs::fixture::ChildPath;
 use assert_fs::{
     assert::PathAssert,
-    fixture::{FileTouch, FileWriteStr, PathChild, PathCreateDir},
+    fixture::{FileTouch, FileWriteBin, FileWriteStr, PathChild, PathCreateDir},
 };
 use indoc::indoc;
-use insta::assert_snapshot;
+use insta::{allow_duplicates, assert_snapshot};
 use predicates::prelude::predicate;
+use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use uv_fs::Simplified;
 use uv_fs::copy_dir_all;
 use uv_static::EnvVars;
 
+use uv_test::packse::{
+    PackseServer, generate_wheel, generate_wheel_with_files, scenario::Scenario,
+};
 use uv_test::uv_snapshot;
 
 #[cfg(feature = "test-git")]
@@ -5436,7 +5441,32 @@ async fn tool_install_default_credentials() -> Result<()> {
 
 /// Test installing a tool with `--with-executables-from`.
 #[test]
-fn tool_install_with_executables_from() {
+fn tool_install_with_executables_from() -> Result<()> {
+    let scenario = toml::from_str::<Scenario>(indoc! {r#"
+        name = "tool-executables"
+
+        [root]
+
+        [expected]
+        satisfiable = true
+
+        [packages.main-tool.versions."1.0.0"]
+        requires_python = ">=3.11"
+        sdist = false
+        requires = ["dependency-tool"]
+        entry_points = ["main"]
+
+        [packages.dependency-tool.versions."1.0.0"]
+        requires_python = ">=3.11"
+        sdist = false
+        entry_points = ["dep-one", "dep-two"]
+
+        [packages.extra-tool.versions."1.0.0"]
+        requires_python = ">=3.11"
+        sdist = false
+        entry_points = ["extra"]
+    "#})?;
+    let index = PackseServer::from_scenario(&scenario);
     let context = uv_test::test_context!("3.12")
         .with_filtered_counts()
         .with_filtered_exe_suffix()
@@ -5446,73 +5476,98 @@ fn tool_install_with_executables_from() {
 
     uv_snapshot!(context.filters(), context.tool_install()
         .arg("--with-executables-from")
-        .arg("ansible-core,black")
-        .arg("ansible==9.3.0")
+        .arg("dependency-tool,extra-tool")
+        .arg("main-tool==1.0.0")
+        .arg("--index-url")
+        .arg(index.index_url())
         .env(EnvVars::PATH, bin_dir.as_os_str()), @"
     exit_code: 0 (success)
     ----- stderr -----
     Resolved [N] packages in [TIME]
     Prepared [N] packages in [TIME]
     Installed [N] packages in [TIME]
-     + ansible==9.3.0
-     + ansible-core==2.16.4
-     + black==24.3.0
-     + cffi==1.16.0
-     + click==8.1.7
-     + cryptography==42.0.5
-     + jinja2==3.1.3
-     + markupsafe==2.1.5
-     + mypy-extensions==1.0.0
-     + packaging==24.0
-     + pathspec==0.12.1
-     + platformdirs==4.2.0
-     + pycparser==2.21
-     + pyyaml==6.0.1
-     + resolvelib==1.0.1
-    Installed 11 executables from `ansible-core`: ansible, ansible-config, ansible-connection, ansible-console, ansible-doc, ansible-galaxy, ansible-inventory, ansible-playbook, ansible-pull, ansible-test, ansible-vault
-    Installed 2 executables from `black`: black, blackd
-    Installed 1 executable: ansible-community
+     + dependency-tool==1.0.0
+     + extra-tool==1.0.0
+     + main-tool==1.0.0
+    Installed 2 executables from `dependency-tool`: dep-one, dep-two
+    Installed 1 executable from `extra-tool`: extra
+    Installed 1 executable: main
     ");
 
+    let receipt = fs_err::read_to_string(tool_dir.join("main-tool").join("uv-receipt.toml"))?;
     insta::with_settings!({
         filters => context.filters(),
     }, {
-        assert_snapshot!(fs_err::read_to_string(tool_dir.join("ansible").join("uv-receipt.toml")).unwrap(), @r#"
+        assert_snapshot!(receipt, @r#"
         [tool]
         requirements = [
-            { name = "ansible", specifier = "==9.3.0" },
-            { name = "ansible-core" },
-            { name = "black" },
+            { name = "main-tool", specifier = "==1.0.0" },
+            { name = "dependency-tool" },
+            { name = "extra-tool" },
         ]
         entrypoints = [
-            { name = "ansible", install-path = "[TEMP_DIR]/bin/ansible", from = "ansible-core" },
-            { name = "ansible-community", install-path = "[TEMP_DIR]/bin/ansible-community", from = "ansible" },
-            { name = "ansible-config", install-path = "[TEMP_DIR]/bin/ansible-config", from = "ansible-core" },
-            { name = "ansible-connection", install-path = "[TEMP_DIR]/bin/ansible-connection", from = "ansible-core" },
-            { name = "ansible-console", install-path = "[TEMP_DIR]/bin/ansible-console", from = "ansible-core" },
-            { name = "ansible-doc", install-path = "[TEMP_DIR]/bin/ansible-doc", from = "ansible-core" },
-            { name = "ansible-galaxy", install-path = "[TEMP_DIR]/bin/ansible-galaxy", from = "ansible-core" },
-            { name = "ansible-inventory", install-path = "[TEMP_DIR]/bin/ansible-inventory", from = "ansible-core" },
-            { name = "ansible-playbook", install-path = "[TEMP_DIR]/bin/ansible-playbook", from = "ansible-core" },
-            { name = "ansible-pull", install-path = "[TEMP_DIR]/bin/ansible-pull", from = "ansible-core" },
-            { name = "ansible-test", install-path = "[TEMP_DIR]/bin/ansible-test", from = "ansible-core" },
-            { name = "ansible-vault", install-path = "[TEMP_DIR]/bin/ansible-vault", from = "ansible-core" },
-            { name = "black", install-path = "[TEMP_DIR]/bin/black", from = "black" },
-            { name = "blackd", install-path = "[TEMP_DIR]/bin/blackd", from = "black" },
+            { name = "dep-one", install-path = "[TEMP_DIR]/bin/dep-one", from = "dependency-tool" },
+            { name = "dep-two", install-path = "[TEMP_DIR]/bin/dep-two", from = "dependency-tool" },
+            { name = "extra", install-path = "[TEMP_DIR]/bin/extra", from = "extra-tool" },
+            { name = "main", install-path = "[TEMP_DIR]/bin/main", from = "main-tool" },
         ]
 
         [tool.options]
+        index-url = "http://[LOCALHOST]/simple/"
         exclude-newer = "2024-03-25T00:00:00Z"
         "#);
     });
 
+    uv_snapshot!(context.filters(), Command::new(bin_dir.join("dep-one")), @"
+    exit_code: 0 (success)
+    ----- stdout -----
+    Hello from dependency-tool!
+    ");
+
     uv_snapshot!(context.filters(), context.tool_uninstall()
-        .arg("ansible")
+        .arg("main-tool")
         .env(EnvVars::PATH, bin_dir.as_os_str()), @"
     exit_code: 0 (success)
     ----- stderr -----
-    Uninstalled 14 executables: ansible, ansible-community, ansible-config, ansible-connection, ansible-console, ansible-doc, ansible-galaxy, ansible-inventory, ansible-playbook, ansible-pull, ansible-test, ansible-vault, black, blackd
+    Uninstalled 4 executables: dep-one, dep-two, extra, main
     ");
+    Ok(())
+}
+
+#[test]
+fn tool_install_sdist_entry_point() -> Result<()> {
+    let scenario = toml::from_str::<Scenario>(indoc! {r#"
+        name = "sdist-entry-point"
+
+        [root]
+
+        [expected]
+        satisfiable = true
+
+        [packages.scenario-tool.versions."1.0.0"]
+        wheel = false
+        entry_points = ["scenario.tool"]
+    "#})?;
+    let index = PackseServer::from_scenario(&scenario);
+    let context = uv_test::test_context!("3.12").with_tool_dirs();
+    let bin_dir = context.temp_dir.child("bin");
+
+    context
+        .tool_install()
+        .arg("scenario-tool")
+        .arg("--index-url")
+        .arg(index.index_url())
+        .env(EnvVars::PATH, bin_dir.as_os_str())
+        .assert()
+        .success();
+
+    uv_snapshot!(context.filters(), Command::new(bin_dir.join("scenario.tool")), @"
+    exit_code: 0 (success)
+    ----- stdout -----
+    Hello from scenario-tool!
+    ");
+
+    Ok(())
 }
 
 /// Test installing a tool with `--with-executables-from`, but the package has no entrypoints.
@@ -6073,5 +6128,252 @@ fn tool_install_lock_revalidates_changed_constraints() -> Result<()> {
     Installed 2 executables: black, blackd
     ");
 
+    Ok(())
+}
+
+#[test]
+fn tool_install_with_build_hashes() -> Result<()> {
+    for preview in ["--no-preview", "--preview-features=tool-install-locks"] {
+        let context = uv_test::test_context!("3.12")
+            .with_filtered_exe_suffix()
+            .with_tool_dirs();
+        let bin_dir = context.temp_dir.child("bin");
+        let (filename, wheel) = generate_wheel(
+            &"build-dependency".parse()?,
+            &"1.0.0".parse()?,
+            &[],
+            &BTreeMap::new(),
+            None,
+            "py3-none-any",
+            &[],
+        );
+        let hash = hex::encode(Sha256::digest(&wheel));
+        context
+            .temp_dir
+            .child("wheels")
+            .child(filename)
+            .write_binary(&wheel)?;
+        let (filename, wheel) = generate_wheel_with_files(
+            &"hash-tool".parse()?,
+            &"1.0.0".parse()?,
+            &[],
+            &BTreeMap::new(),
+            None,
+            "py3-none-any",
+            &[
+                ("hash_tool/cli.py", "def main():\n    print('tool-ok')\n"),
+                (
+                    "hash_tool-1.0.0.dist-info/entry_points.txt",
+                    "[console_scripts]\nhash-tool = hash_tool.cli:main\n",
+                ),
+            ],
+        );
+        context
+            .temp_dir
+            .child("wheels")
+            .child(filename)
+            .write_binary(&wheel)?;
+        let context = context.with_filter((hash.clone(), "[BUILD_HASH]"));
+        let project = context.temp_dir.child("project");
+        project.child("pyproject.toml").write_str(indoc! {r#"
+            [build-system]
+            requires = ["build-dependency==1.0.0"]
+            build-backend = "backend"
+            backend-path = ["."]
+        "#})?;
+        project.child("backend.py").write_str(indoc! {r#"
+            import shutil
+            from pathlib import Path
+
+            import build_dependency
+
+            Path(__file__).with_name("backend-executed").touch()
+
+            def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+                wheel = Path(__file__).parent.parent / "wheels" / "hash_tool-1.0.0-py3-none-any.whl"
+                shutil.copyfile(wheel, Path(wheel_directory) / wheel.name)
+                return wheel.name
+        "#})?;
+        let constraints = context.temp_dir.child("constraints.txt");
+        constraints.write_str(&format!("build-dependency==1.0.0 --hash=sha256:{hash}\n"))?;
+
+        let install = || {
+            let mut command = context.tool_install();
+            command
+                .arg("hash-tool @ ./project")
+                .args(["--no-index", "--find-links", "wheels"])
+                .args(["--build-constraint", "constraints.txt", "--no-cache"])
+                .arg(preview)
+                .env(EnvVars::PATH, bin_dir.as_os_str());
+            command
+        };
+        allow_duplicates! {
+            uv_snapshot!(context.filters(), install(), @"
+            exit_code: 0 (success)
+            ----- stderr -----
+            Resolved 1 package in [TIME]
+            Prepared 1 package in [TIME]
+            Installed 1 package in [TIME]
+             + hash-tool==1.0.0 (from file://[TEMP_DIR]/project)
+            Installed 1 executable: hash-tool
+            ");
+        }
+        allow_duplicates! {
+            insta::with_settings!({ filters => context.filters() }, {
+                assert_snapshot!(context.read("tools/hash-tool/uv-receipt.toml"), @r#"
+                [tool]
+                requirements = [{ name = "hash-tool", directory = "[TEMP_DIR]/project" }]
+                build-constraint-dependencies = [{ name = "build-dependency", specifier = "==1.0.0", hashes = ["sha256:[BUILD_HASH]"] }]
+                entrypoints = [
+                    { name = "hash-tool", install-path = "[TEMP_DIR]/bin/hash-tool", from = "hash-tool" },
+                ]
+
+                [tool.options]
+                no-index = true
+                find-links = ["file://[TEMP_DIR]/wheels"]
+                exclude-newer = "2024-03-25T00:00:00Z"
+                "#);
+            });
+        }
+
+        // The supplied hash is checked even when it isn't required.
+        fs_err::remove_file(project.child("backend-executed"))?;
+        constraints.write_str(&format!(
+            "build-dependency==1.0.0 --hash=sha256:{}\n",
+            "0".repeat(64)
+        ))?;
+        allow_duplicates! {
+            uv_snapshot!(context.filters(), install().arg("--reinstall"), @"
+            exit_code: 1 (failure)
+            ----- stderr -----
+            error: Failed to build `hash-tool @ file://[TEMP_DIR]/project`
+              cause: Failed to install requirements from `build-system.requires`
+              cause: Failed to download `build-dependency==1.0.0`
+              cause: Hash mismatch for `build-dependency==1.0.0`
+
+                     Expected:
+                       sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+                     Computed:
+                       sha256:[BUILD_HASH]
+            ");
+        }
+        project
+            .child("backend-executed")
+            .assert(predicate::path::missing());
+
+        // Name inference must check hashes before importing the build backend.
+        allow_duplicates! {
+            uv_snapshot!(context.filters(), context.tool_install()
+                .arg("./project")
+                .args(["--no-index", "--find-links", "wheels"])
+                .args(["--build-constraint", "constraints.txt", "--no-cache"])
+                .arg(preview)
+                .env(EnvVars::PATH, bin_dir.as_os_str()), @"
+            exit_code: 2 (failure)
+            ----- stderr -----
+            error: Failed to install requirements from `build-system.requires`
+              cause: Failed to download `build-dependency==1.0.0`
+              cause: Hash mismatch for `build-dependency==1.0.0`
+
+                     Expected:
+                       sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+                     Computed:
+                       sha256:[BUILD_HASH]
+            ");
+        }
+        project
+            .child("backend-executed")
+            .assert(predicate::path::missing());
+
+        allow_duplicates! {
+            uv_snapshot!(context.filters(), context.tool_run()
+                .args(["--from", "./project"])
+                .args(["--no-index", "--find-links", "wheels"])
+                .args(["--build-constraint", "constraints.txt", "--no-cache"])
+                .arg(preview)
+                .arg("hash-tool"), @"
+            exit_code: 1 (failure)
+            ----- stderr -----
+            error: Failed to resolve `--with` requirement
+              cause: Failed to install requirements from `build-system.requires`
+              cause: Failed to download `build-dependency==1.0.0`
+              cause: Hash mismatch for `build-dependency==1.0.0`
+
+                     Expected:
+                       sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+                     Computed:
+                       sha256:[BUILD_HASH]
+            ");
+        }
+        project
+            .child("backend-executed")
+            .assert(predicate::path::missing());
+
+        // Upgrades must retain the original hashes without re-reading the constraints file.
+        fs_err::remove_file(&constraints)?;
+        let mut upgrade = context.tool_upgrade();
+        upgrade
+            .args(["hash-tool", "--reinstall", "--no-cache"])
+            .arg(preview)
+            .env(EnvVars::PATH, bin_dir.as_os_str());
+        if preview == "--no-preview" {
+            uv_snapshot!(context.filters(), upgrade, @"
+            exit_code: 0 (success)
+            ----- stderr -----
+            Modified hash-tool environment
+             ~ hash-tool==1.0.0 (from file://[TEMP_DIR]/project)
+            Nothing to upgrade
+            ");
+        } else {
+            upgrade.assert().success();
+        }
+        project
+            .child("backend-executed")
+            .assert(predicate::path::exists());
+
+        // Unpinned hashes are ignored in verification mode, including when saved in a tool receipt.
+        fs_err::remove_file(project.child("backend-executed"))?;
+        constraints.write_str(&format!(
+            "build-dependency>=1.0.0 --hash=sha256:{}\n",
+            "0".repeat(64)
+        ))?;
+        install().arg("--reinstall").assert().success();
+        project
+            .child("backend-executed")
+            .assert(predicate::path::exists());
+        allow_duplicates! {
+            insta::with_settings!({ filters => context.filters() }, {
+                assert_snapshot!(context.read("tools/hash-tool/uv-receipt.toml"), @r#"
+                [tool]
+                requirements = [{ name = "hash-tool", directory = "[TEMP_DIR]/project" }]
+                build-constraint-dependencies = [{ name = "build-dependency", specifier = ">=1.0.0", hashes = ["sha256:0000000000000000000000000000000000000000000000000000000000000000"] }]
+                entrypoints = [
+                    { name = "hash-tool", install-path = "[TEMP_DIR]/bin/hash-tool", from = "hash-tool" },
+                ]
+
+                [tool.options]
+                no-index = true
+                find-links = ["file://[TEMP_DIR]/wheels"]
+                exclude-newer = "2024-03-25T00:00:00Z"
+                "#);
+            });
+        }
+
+        fs_err::remove_file(project.child("backend-executed"))?;
+        fs_err::remove_file(constraints)?;
+        context
+            .tool_upgrade()
+            .args(["hash-tool", "--reinstall", "--no-cache"])
+            .arg(preview)
+            .env(EnvVars::PATH, bin_dir.as_os_str())
+            .assert()
+            .success();
+        project
+            .child("backend-executed")
+            .assert(predicate::path::exists());
+    }
     Ok(())
 }

@@ -12,7 +12,7 @@ use tracing::{debug, instrument};
 
 use uv_build_backend::check_direct_build;
 use uv_cache::{Cache, CacheBucket};
-use uv_client::{BaseClientBuilder, FlatIndexClient, RegistryClientBuilder};
+use uv_client::{BaseClientBuilder, RegistryClientBuilder};
 use uv_configuration::{
     BuildIsolation, BuildKind, BuildOptions, BuildOutput, Concurrency, Constraints,
     DependencyGroupsWithDefaults, HashCheckingMode, IndexStrategy, KeyringProviderType, NoSources,
@@ -23,8 +23,8 @@ use uv_distribution_filename::{
     DistFilename, SourceDistExtension, SourceDistFilename, WheelFilename,
 };
 use uv_distribution_types::{
-    ConfigSettings, DependencyMetadata, ExtraBuildVariables, Index, IndexLocations,
-    PackageConfigSettings, Requirement, SourceDist,
+    ConfigSettings, DependencyMetadata, ExtraBuildVariables, IndexLocations,
+    NameRequirementSpecification, PackageConfigSettings, SourceDist,
 };
 use uv_errors::{ErrorOptions, Hinted, Hints, write_error_chain_with_options};
 use uv_fs::{Simplified, normalize_path, relative_to};
@@ -202,7 +202,7 @@ pub(crate) async fn build_frontend(
     force_pep517: bool,
     clear: bool,
     build_constraints: Vec<RequirementsSource>,
-    build_constraints_from_workspace: Vec<Requirement>,
+    build_constraints_from_workspace: Vec<NameRequirementSpecification>,
     hash_checking: Option<HashCheckingMode>,
     python: Option<String>,
     install_mirrors: PythonInstallMirrors,
@@ -280,7 +280,7 @@ async fn build_impl(
     force_pep517: bool,
     clear: bool,
     build_constraints: &[RequirementsSource],
-    build_constraints_from_workspace: &[Requirement],
+    build_constraints_from_workspace: &[NameRequirementSpecification],
     hash_checking: Option<HashCheckingMode>,
     python_request: Option<&str>,
     install_mirrors: PythonInstallMirrors,
@@ -558,7 +558,7 @@ async fn build_package(
     force_pep517: bool,
     clear: bool,
     build_constraints: &[RequirementsSource],
-    build_constraints_from_workspace: &[Requirement],
+    build_constraints_from_workspace: &[NameRequirementSpecification],
     build_isolation: &BuildIsolation,
     extra_build_dependencies: &ExtraBuildDependencies,
     extra_build_variables: &ExtraBuildVariables,
@@ -635,29 +635,34 @@ async fn build_package(
     .into_interpreter();
 
     // Read build constraints.
-    let build_constraints =
+    let command_line_constraints =
         operations::read_constraints(build_constraints, &client_builder).await?;
+    let build_constraints = Constraints::from_specifications(
+        command_line_constraints
+            .iter()
+            .cloned()
+            .chain(build_constraints_from_workspace.iter().cloned()),
+    );
 
-    // Collect the set of required hashes.
     let hasher = if let Some(hash_checking) = hash_checking {
-        HashStrategy::from_requirements(
-            std::iter::empty(),
-            build_constraints
-                .iter()
-                .map(|entry| (&entry.requirement, entry.hashes.as_slice())),
+        // Under `--require-hashes`, include all command-line constraints, but only workspace
+        // constraints with supplied hashes. Other workspace constraints still restrict builds.
+        let hash_constraints = Constraints::from_specifications(
+            command_line_constraints.iter().cloned().chain(
+                build_constraints_from_workspace
+                    .iter()
+                    .filter(|entry| !hash_checking.is_require() || !entry.hashes.is_empty())
+                    .cloned(),
+            ),
+        );
+        HashStrategy::from_constraints(
+            &hash_constraints,
             Some(&interpreter.to_resolver_marker_environment()),
             hash_checking,
         )?
     } else {
         HashStrategy::default()
     };
-
-    let build_constraints = Constraints::from_requirements(
-        build_constraints
-            .into_iter()
-            .map(|constraint| constraint.requirement)
-            .chain(build_constraints_from_workspace.iter().cloned()),
-    );
 
     // Initialize the registry client.
     let client = RegistryClientBuilder::new(client_builder.clone(), cache.clone())
@@ -683,13 +688,7 @@ async fn build_package(
     };
 
     // Resolve the flat indexes from `--find-links`.
-    let flat_index = {
-        let client = FlatIndexClient::new(client.cached_client(), client.connectivity(), cache);
-        let entries = client
-            .fetch_all(index_locations.flat_indexes().map(Index::url))
-            .await?;
-        FlatIndex::from_entries(entries)
-    };
+    let flat_index = FlatIndex::load(&client, cache, index_locations).await?;
 
     // Initialize any shared state.
     let state = SharedState::default();

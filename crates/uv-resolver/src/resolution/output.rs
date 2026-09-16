@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
@@ -112,18 +112,16 @@ impl Display for ResolutionGraphNode {
 
 #[derive(Debug, Eq, PartialEq, Hash)]
 struct PackageRef<'a> {
-    package_name: &'a PackageName,
+    package: &'a ResolutionPackage,
     version: &'a Version,
-    url: Option<&'a VerbatimParsedUrl>,
-    index: Option<&'a IndexUrl>,
-    extra: Option<&'a ExtraName>,
-    group: Option<&'a GroupName>,
 }
 
 impl ResolverOutput {
     /// Create a new [`ResolverOutput`] from the resolved PubGrub state.
     pub(crate) fn from_state(
         resolutions: &[Resolution],
+        project: Option<&PackageName>,
+        workspace_members: &BTreeSet<PackageName>,
         requirements: Vec<Requirement>,
         constraints: Constraints,
         overrides: Overrides,
@@ -165,6 +163,7 @@ impl ResolverOutput {
                     git,
                     package,
                     version,
+                    project == Some(&package.name) || workspace_members.contains(&package.name),
                 )?;
             }
         }
@@ -288,21 +287,13 @@ impl ResolverOutput {
     ) {
         let from_index = edge.from.as_ref().map_or(root_index, |from| {
             inverse[&PackageRef {
-                package_name: from,
-                version: &edge.from_version,
-                url: edge.from_url.as_ref(),
-                index: edge.from_index.as_ref(),
-                extra: edge.from_extra.as_ref(),
-                group: edge.from_group.as_ref(),
+                package: &from.package,
+                version: &from.version,
             }]
         });
         let to_index = inverse[&PackageRef {
-            package_name: &edge.to,
-            version: &edge.to_version,
-            url: edge.to_url.as_ref(),
-            index: edge.to_index.as_ref(),
-            extra: edge.to_extra.as_ref(),
-            group: edge.to_group.as_ref(),
+            package: &edge.to.package,
+            version: &edge.to.version,
         }];
 
         let edge_marker = {
@@ -334,6 +325,7 @@ impl ResolverOutput {
         git: &GitResolver,
         package: &'a ResolutionPackage,
         version: &'a Version,
+        is_workspace_member: bool,
     ) -> Result<(), ResolveError> {
         let ResolutionPackage {
             name,
@@ -355,6 +347,16 @@ impl ResolverOutput {
             in_memory,
             git,
         )?;
+
+        // We normally write dependency paths relative to the lockfile. For the current project and
+        // workspace members, preserve the user's choice of relative or absolute paths instead.
+        // Metadata from `tool.uv.dependency-metadata` already preserves that choice.
+        // Only change this copy, not shared metadata.
+        let metadata = if is_workspace_member {
+            metadata.map(|metadata| metadata.with_force_relative(false))
+        } else {
+            metadata
+        };
 
         if let Some(metadata) = metadata.as_ref() {
             // Validate the extra.
@@ -389,17 +391,7 @@ impl ResolverOutput {
             metadata,
             marker: UniversalMarker::TRUE,
         }));
-        inverse.insert(
-            PackageRef {
-                package_name: name,
-                version,
-                url: url.as_ref(),
-                index: index.as_ref(),
-                extra: extra.as_ref(),
-                group: group.as_ref(),
-            },
-            node,
-        );
+        inverse.insert(PackageRef { package, version }, node);
         Ok(())
     }
 
