@@ -1,5 +1,5 @@
 ---
-source: crates/uv-resolver/src/lock/mod.rs
+source: crates/uv-lock/src/lock/mod.rs
 expression: result
 ---
 Ok(
@@ -54,30 +54,8 @@ Ok(
                     name: PackageName(
                         "a",
                     ),
-                    version: None,
-                    source: Editable(
-                        "path/to/a",
-                    ),
-                },
-                sdist: None,
-                wheels: [],
-                fork_markers: [],
-                dependencies: [],
-                optional_dependencies: {},
-                dependency_groups: {},
-                metadata: PackageMetadata {
-                    requires_dist: {},
-                    provides_extra: [],
-                    dependency_groups: {},
-                },
-            },
-            Package {
-                id: PackageId {
-                    name: PackageName(
-                        "a",
-                    ),
                     version: Some(
-                        "0.1.1",
+                        "0.1.0",
                     ),
                     source: Registry(
                         Url(
@@ -95,10 +73,9 @@ Ok(
                         metadata: SourceDistMetadata {
                             hash: Some(
                                 Hash(
-                                    HashDigest {
-                                        algorithm: Sha256,
-                                        digest: "37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3",
-                                    },
+                                    Sha256(
+                                        "37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3",
+                                    ),
                                 ),
                             ),
                             size: Some(
@@ -143,10 +120,9 @@ Ok(
                         metadata: SourceDistMetadata {
                             hash: Some(
                                 Hash(
-                                    HashDigest {
-                                        algorithm: Sha256,
-                                        digest: "37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3",
-                                    },
+                                    Sha256(
+                                        "37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3",
+                                    ),
                                 ),
                             ),
                             size: Some(
@@ -164,9 +140,15 @@ Ok(
                             name: PackageName(
                                 "a",
                             ),
-                            version: None,
-                            source: Editable(
-                                "path/to/a",
+                            version: Some(
+                                "0.1.0",
+                            ),
+                            source: Registry(
+                                Url(
+                                    UrlString(
+                                        "https://pypi.org/simple",
+                                    ),
+                                ),
                             ),
                         },
                         index: PackageIndex(
@@ -193,19 +175,8 @@ Ok(
                 name: PackageName(
                     "a",
                 ),
-                version: None,
-                source: Editable(
-                    "path/to/a",
-                ),
-            }: PackageIndex(
-                0,
-            ),
-            PackageId {
-                name: PackageName(
-                    "a",
-                ),
                 version: Some(
-                    "0.1.1",
+                    "0.1.0",
                 ),
                 source: Registry(
                     Url(
@@ -215,7 +186,7 @@ Ok(
                     ),
                 ),
             }: PackageIndex(
-                1,
+                0,
             ),
             PackageId {
                 name: PackageName(
@@ -232,7 +203,7 @@ Ok(
                     ),
                 ),
             }: PackageIndex(
-                2,
+                1,
             ),
         },
         manifest: ResolverManifest {

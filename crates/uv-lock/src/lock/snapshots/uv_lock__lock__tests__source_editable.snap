@@ -1,5 +1,5 @@
 ---
-source: crates/uv-resolver/src/lock/mod.rs
+source: crates/uv-lock/src/lock/mod.rs
 expression: result
 ---
 Ok(
@@ -57,7 +57,7 @@ Ok(
                     version: Some(
                         "4.3.0",
                     ),
-                    source: Directory(
+                    source: Editable(
                         "path/to/dir",
                     ),
                 },
@@ -82,7 +82,7 @@ Ok(
                 version: Some(
                     "4.3.0",
                 ),
-                source: Directory(
+                source: Editable(
                     "path/to/dir",
                 ),
             }: PackageIndex(
