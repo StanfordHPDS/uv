@@ -1,6 +1,6 @@
 [package]
 name = "uv-configuration"
-version = "0.0.82"
+version = "0.0.83"
 description = "This is an internal component crate of uv"
 edition = { workspace = true }
 rust-version = { workspace = true }
@@ -35,7 +35,6 @@ clap = { workspace = true, features = ["derive"], optional = true }
 either = { workspace = true }
 fs-err = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }
-rayon = { workspace = true }
 reqwest = { workspace = true }
 rustc-hash = { workspace = true }
 same-file = { workspace = true }

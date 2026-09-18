@@ -18,9 +18,12 @@ env:
 
 jobs:
   plan:
+    # CI on main is redundant in the security repository.
+    if: ${{ github.repository != 'astral-sh/uv-security' || github.ref != 'refs/heads/main' }}
     uses: $/.github/workflows/plan.yml
 
   check-fmt:
+    needs: plan
     uses: $/.github/workflows/check-fmt.yml
 
   review:
@@ -64,6 +67,15 @@ jobs:
     needs: plan
     if: ${{ needs.plan.outputs.run-checks == 'true' }}
     uses: $/.github/workflows/check-release.yml
+
+  check-crates-policies:
+    needs: plan
+    if: ${{ needs.plan.outputs.check-crates-policies == 'true' }}
+    uses: $/.github/workflows/check-crates-policies.yml
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
 
   check-lock:
     needs: plan
@@ -292,11 +304,13 @@ jobs:
 
   required-checks-passed:
     name: "all required jobs passed"
-    if: always()
+    if: ${{ always() && github.ref != 'refs/heads/main' }}
     needs:
+      - plan
       - check-fmt
       - check-lint
       - check-docs
+      - check-crates-policies
       - check-generated-files
       - test
       - test-system
