@@ -3740,6 +3740,7 @@ impl PipSyncSettings {
             dry_run,
             torch_backend,
             compat_args: _,
+            check,
         } = *args;
 
         Ok(Self {
@@ -3752,7 +3753,11 @@ impl PipSyncSettings {
                 .into_iter()
                 .filter_map(Maybe::into_option)
                 .collect(),
-            dry_run: DryRun::from_args(dry_run),
+            dry_run: if check {
+                DryRun::Check
+            } else {
+                DryRun::from_args(dry_run)
+            },
             refresh: Refresh::try_from(refresh)?,
             settings: PipSettings::combine(
                 PipOptions {
@@ -3864,6 +3869,7 @@ impl PipInstallSettings {
             dry_run,
             torch_backend,
             compat_args: _,
+            check,
         } = args;
 
         let constraints_from_workspace = if let Some(configuration) = &filesystem {
@@ -3931,7 +3937,11 @@ impl PipInstallSettings {
                 .into_iter()
                 .filter_map(Maybe::into_option)
                 .collect(),
-            dry_run: DryRun::from_args(dry_run),
+            dry_run: if check {
+                DryRun::Check
+            } else {
+                DryRun::from_args(dry_run)
+            },
             constraints_from_workspace,
             overrides_from_workspace,
             excludes_from_workspace,
@@ -4286,6 +4296,7 @@ impl PipCheckSettings {
 /// The resolved settings to use for a `build` invocation.
 #[derive(Debug, Clone)]
 pub(crate) struct BuildSettings {
+    pub(crate) skip_dependency_check: bool,
     pub(crate) src: Option<PathBuf>,
     pub(crate) package: Option<PackageName>,
     pub(crate) all_packages: bool,
@@ -4314,6 +4325,7 @@ impl BuildSettings {
         environment: EnvironmentOptions,
     ) -> anyhow::Result<Self> {
         let BuildArgs {
+            skip_dependency_check,
             src,
             out_dir,
             package,
@@ -4365,6 +4377,7 @@ impl BuildSettings {
         };
 
         Ok(Self {
+            skip_dependency_check,
             src,
             package,
             all_packages,

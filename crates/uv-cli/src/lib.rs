@@ -2179,6 +2179,12 @@ pub struct PipSyncArgs {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Check whether the environment matches the requirements without modifying it.
+    ///
+    /// Resolve and report any necessary changes, exiting with code 1 if changes are needed.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub check: bool,
+
     /// The backend to use when fetching packages in the PyTorch ecosystem (e.g., `cpu`, `cu126`, or `auto`).
     ///
     /// When set, uv will ignore the configured index URLs for packages in the PyTorch ecosystem,
@@ -2524,6 +2530,12 @@ pub struct PipInstallArgs {
     /// print the resulting plan.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Check whether the environment satisfies the requirements without modifying it.
+    ///
+    /// Resolve and report any necessary changes, exiting with code 1 if changes are needed.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub check: bool,
 
     /// The backend to use when fetching packages in the PyTorch ecosystem (e.g., `cpu`, `cu126`, or `auto`)
     ///
@@ -2982,6 +2994,14 @@ pub struct PipDebugArgs {
 
 #[derive(Args)]
 pub struct BuildArgs {
+    /// Skip checking if build dependencies are satisfied when building without isolation.
+    ///
+    /// Only affects builds with the `build-dependency-check` preview feature enabled. By
+    /// default, that feature checks declared, backend-reported, and transitive build requirements
+    /// in the selected environment before building. Isolated builds install their requirements.
+    #[arg(long, hide = true)]
+    pub skip_dependency_check: bool,
+
     /// The directory from which distributions should be built, or a source
     /// distribution archive to build into a wheel.
     ///

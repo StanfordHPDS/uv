@@ -837,7 +837,7 @@ dependencies = ["flask==1.0.x"]
     ----- stderr -----
     error: Failed to build `project @ file://[TEMP_DIR]/path_dep`
       cause: The build backend returned an error
-      cause: Call to `setuptools.build_meta:__legacy__.build_wheel` failed (exit status: 1)
+      cause: Call to `setuptools.build_meta:__legacy__.get_requires_for_build_wheel` failed (exit status: 1)
 
              [stdout]
              configuration error: `project.dependencies[0]` must be pep508
@@ -6816,6 +6816,64 @@ fn dry_run_install() -> std::result::Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn check_install() {
+    let context = uv_test::test_context!("3.12");
+
+    uv_snapshot!(context.pip_install().arg("iniconfig==2.0.0").arg("--check"), @"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Would download 1 package
+    Would install 1 package
+     + iniconfig==2.0.0
+    ");
+
+    // Checking must leave the environment unchanged.
+    uv_snapshot!(context.pip_install().arg("iniconfig==2.0.0"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + iniconfig==2.0.0
+    ");
+
+    uv_snapshot!(context.pip_install().arg("iniconfig==2.0.0").arg("--check").arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Checked 1 package in [TIME]
+    Would make no changes
+    ");
+
+    // Exact installs bypass the fast path and check the resolved plan.
+    uv_snapshot!(context.pip_install().arg("iniconfig==2.0.0").arg("--check").arg("--exact"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Checked 1 package in [TIME]
+    Would make no changes
+    ");
+
+    uv_snapshot!(context.pip_install().arg("iniconfig==1.1.1").arg("--check"), @"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Would download 1 package
+    Would uninstall 1 package
+    Would install 1 package
+     - iniconfig==2.0.0
+     + iniconfig==1.1.1
+    ");
+
+    context
+        .assert_command(
+            "import importlib.metadata; print(importlib.metadata.version('iniconfig'), end='')",
+        )
+        .success()
+        .stdout("2.0.0");
+}
+
+#[test]
 fn dry_run_install_url_dependency() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let context = uv_test::test_context!("3.12");
     let requirements_txt = context.temp_dir.child("requirements.txt");
@@ -10922,7 +10980,7 @@ fn sklearn() {
     ----- stderr -----
     error: Failed to build `sklearn==0.0.post12`
       cause: The build backend returned an error
-      cause: Call to `setuptools.build_meta:__legacy__.build_wheel` failed (exit status: 1)
+      cause: Call to `setuptools.build_meta:__legacy__.get_requires_for_build_wheel` failed (exit status: 1)
 
              [stderr]
              The 'sklearn' PyPI package is deprecated, use 'scikit-learn'
@@ -10969,7 +11027,7 @@ fn resolve_derivation_chain() -> Result<()> {
     ----- stderr -----
     error: Failed to build `wsgiref==0.1.2`
       cause: The build backend returned an error
-      cause: Call to `setuptools.build_meta:__legacy__.build_wheel` failed (exit status: 1)
+      cause: Call to `setuptools.build_meta:__legacy__.get_requires_for_build_wheel` failed (exit status: 1)
 
              [stderr]
              Traceback (most recent call last):
@@ -15789,7 +15847,7 @@ fn pip_install_build_dependencies_respect_locked_versions() -> Result<()> {
     Resolved [N] packages in [TIME]
     error: Failed to build `child @ file://[TEMP_DIR]/child`
       cause: The build backend returned an error
-      cause: Call to `build_backend.build_wheel` failed (exit status: 1)
+      cause: Call to `build_backend.get_requires_for_build_wheel` failed (exit status: 1)
 
              [stderr]
              Expected `a` version 0.1 but got 0.3.0
@@ -15849,7 +15907,7 @@ fn pip_install_build_dependencies_respect_locked_versions() -> Result<()> {
     Resolved [N] packages in [TIME]
     error: Failed to build `child @ file://[TEMP_DIR]/child`
       cause: The build backend returned an error
-      cause: Call to `build_backend.build_wheel` failed (exit status: 1)
+      cause: Call to `build_backend.get_requires_for_build_wheel` failed (exit status: 1)
 
              [stderr]
              Expected `a` version 0.2 but got 0.1.0
