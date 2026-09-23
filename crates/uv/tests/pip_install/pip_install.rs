@@ -126,8 +126,6 @@ fn install_wheel_cache_incompatible_with_older_uv() -> Result<()> {
     allow_duplicates! {
         for version in ["0.11.1", "0.12.0"] {
             let context = uv_test::test_context!("3.12")
-                // TODO: Remove this once the older `interpreter-v4` cache layout is supported.
-                .with_filter((r"(?m)^WARN Broken interpreter cache entry at .*\n", ""))
                 .with_filter((r" \+ uv==0\.(?:11\.1|12\.0)", " + uv==[VERSION]"));
             let wheel = context.temp_dir.join("large_wheel-1.0.0-py3-none-any.whl");
             write_many_files_wheel(&wheel, 1)?;
@@ -148,7 +146,7 @@ fn install_wheel_cache_incompatible_with_older_uv() -> Result<()> {
                 .arg("--cache-dir")
                 .arg(context.cache_dir.path())
                 .env_remove(EnvVars::UV_EXCLUDE_NEWER)
-                .env_remove(EnvVars::UV_TEST_AVAILABLE_VERSION_CUTOFF), @"
+                .env_remove(EnvVars::UV_INTERNAL__TEST_AVAILABLE_VERSION_CUTOFF), @"
             exit_code: 0 (success)
             ----- stderr -----
             Resolved 1 package in [TIME]
@@ -2776,6 +2774,82 @@ fn install_git_workspace_build_requirement() -> Result<()> {
     Ok(())
 }
 
+/// Install a Git package whose checkout marker is a symlink.
+#[test]
+#[cfg(all(unix, feature = "test-git"))]
+fn install_git_checkout_marker_symlink() -> Result<()> {
+    let context = uv_test::test_context!(DEFAULT_PYTHON_VERSION)
+        .with_filters([(r"@[0-9a-f]{40}".to_string(), "@[COMMIT]".to_string())]);
+
+    let victim = context.temp_dir.child("victim");
+    victim.write_str("external contents")?;
+
+    let repository = context.temp_dir.child("repository");
+    repository.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "example"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+
+        [build-system]
+        requires = ["hatchling"]
+        build-backend = "hatchling.build"
+    "#})?;
+    repository
+        .child("src/example/__init__.py")
+        .write_str(r#"__version__ = "0.1.0""#)?;
+    symlink(victim.path(), repository.child(".ok").path())?;
+
+    Command::new("git")
+        .arg("init")
+        .arg(repository.path())
+        .assert()
+        .success();
+    Command::new("git")
+        .arg("-C")
+        .arg(repository.path())
+        .args(["add", "."])
+        .assert()
+        .success();
+    Command::new("git")
+        .arg("-C")
+        .arg(repository.path())
+        .args([
+            "-c",
+            "user.name=ferris",
+            "-c",
+            "user.email=ferris@example.com",
+            "commit",
+            "-m",
+            "Initial commit",
+        ])
+        .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+        .assert()
+        .success();
+
+    let repository_url = Url::from_directory_path(repository.path())
+        .map_err(|()| anyhow!("failed to convert repository path to file URL"))?;
+    let repository_url = repository_url.as_str().trim_end_matches('/');
+
+    uv_snapshot!(context.filters(), context
+        .pip_install()
+        .arg(format!("example @ git+{repository_url}")), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + example==0.1.0 (from git+file://[TEMP_DIR]/repository@[COMMIT])
+    ");
+
+    // A repository-controlled checkout marker must not truncate an external file; see
+    // astral-sh/uv#21857.
+    assert_snapshot!(fs::read_to_string(victim.path())?, @"");
+
+    Ok(())
+}
+
 /// A full commit revision must not resolve to a branch with the same name.
 #[test]
 #[cfg(feature = "test-git")]
@@ -3202,7 +3276,7 @@ async fn install_git_public_rate_limited_by_github_rest_api_429_response() {
         .pip_install()
         .arg("uv-public-pypackage @ git+https://github.com/astral-test/uv-public-pypackage")
         .env(EnvVars::UV_GITHUB_FAST_PATH_URL, server.uri())
-        .env(EnvVars::UV_TEST_NO_HTTP_RETRY_DELAY, "true"), @"
+        .env(EnvVars::UV_INTERNAL__TEST_NO_HTTP_RETRY_DELAY, "true"), @"
     exit_code: 0 (success)
     ----- stderr -----
     Resolved 1 package in [TIME]
@@ -3251,7 +3325,7 @@ fn install_git_public_https_exact_commit() {
     uv_snapshot!(context.filters(), context.pip_install()
         // Normally Updating/Updated notifications are suppressed in tests (because their order can
         // be nondeterministic), but here that's exactly what we want to test for.
-        .env_remove(EnvVars::UV_TEST_NO_CLI_PROGRESS)
+        .env_remove(EnvVars::UV_INTERNAL__TEST_NO_CLI_PROGRESS)
         // Whether fetching happens during resolution or later depends on whether the GitHub fast
         // path is taken, which isn't reliable. Disable it, so that we get a stable order of events
         // here.
@@ -3272,7 +3346,7 @@ fn install_git_public_https_exact_commit() {
 
     // Run the exact same command again, with that commit now in cache.
     uv_snapshot!(context.filters(), context.pip_install()
-        .env_remove(EnvVars::UV_TEST_NO_CLI_PROGRESS)
+        .env_remove(EnvVars::UV_INTERNAL__TEST_NO_CLI_PROGRESS)
         .env(EnvVars::UV_NO_GITHUB_FAST_PATH, "true")
         .arg("uv-public-pypackage @ git+https://github.com/astral-test/uv-public-pypackage@b270df1a2fb5d012294e9aaf05e7e0bab1e6a389")
         , @"
