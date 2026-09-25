@@ -115,6 +115,8 @@ mod tests {
         - <a id="azure-endpoint" href="#azure-endpoint"><code>azure-endpoint</code></a>: Allows signing requests to Azure Blob Storage endpoints with Azure credentials.
         - <a id="batch-export" href="#batch-export"><code>batch-export</code></a>: Allows using `uv export --batch`.
         - <a id="build-dependency-check" href="#build-dependency-check"><code>build-dependency-check</code></a>: Checks build dependencies before nonisolated builds with `uv build`.
+        - <a id="build-lazy-imports" href="#build-lazy-imports"><code>build-lazy-imports</code></a>: Enables lazy imports in build backend invocations on CPython 3.15 and later.
+          This can affect import-time side effects in third-party build backends.
         - <a id="cache-physical-space" href="#cache-physical-space"><code>cache-physical-space</code></a>: Reports the physical disk space reclaimed by cache cleanup, accounting for hardlinks and copy-on-write clones.
         - <a id="cache-size" href="#cache-size"><code>cache-size</code></a>: Allows using `uv cache size`.
         - <a id="centralized-project-envs" href="#centralized-project-envs"><code>centralized-project-envs</code></a>: Stores [project virtual environments](./projects/layout.md#centralized-project-environments)
@@ -153,6 +155,8 @@ mod tests {
         - <a id="pylock" href="#pylock"><code>pylock</code></a>: Allows installing from `pylock.toml` files.
         - <a id="python-install-default" href="#python-install-default"><code>python-install-default</code></a>: Allows [installing `python` and `python3` executables](./python-versions.md#installing-python-executables).
         - <a id="relocatable-envs-default" href="#relocatable-envs-default"><code>relocatable-envs-default</code></a>: Creates relocatable virtual environments by default.
+        - <a id="resolution-inputs" href="#resolution-inputs"><code>resolution-inputs</code></a>: Records runtime configuration consultations and omits unused constraints, overrides, exclusions,
+          dependency metadata, and package-specific upload cutoffs from the lockfile.
         - <a id="s3-endpoint" href="#s3-endpoint"><code>s3-endpoint</code></a>: Allows signing requests to configured S3-compatible endpoints.
         - <a id="sbom-export" href="#sbom-export"><code>sbom-export</code></a>: Allows using `uv export --format=cyclonedx1.5`.
         - <a id="special-conda-env-names" href="#special-conda-env-names"><code>special-conda-env-names</code></a>: Stops treating Conda environments named `base` or `root` as special.
