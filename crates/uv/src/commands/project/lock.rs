@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use owo_colors::OwoColorize;
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use tracing::debug;
 
 use uv_cache::{Cache, Refresh};
@@ -542,6 +542,13 @@ async fn do_lock(
     let members = target.members();
     let packages = target.packages();
     let required_members = target.required_members();
+
+    // Validate explicit defaults before omitting `["dev"]` from the lockfile. Unlike the
+    // implicit default, an explicit `["dev"]` requires the `dev` group to exist.
+    for member in packages.values() {
+        member.default_groups()?;
+    }
+
     let first_party_packages = match target {
         LockTarget::Workspace(workspace) => {
             FirstPartyPackages::from_workspace(workspace, &first_party_exclusions)
@@ -839,7 +846,8 @@ async fn do_lock(
     // Checking an existing lockfile may build metadata and install build dependencies. Verify any
     // artifacts recorded in that lockfile, including for an ordinary unlocked command.
     let (locked_hasher, locked_build_hasher) = if let Some(existing_lock) = existing_lock.as_ref() {
-        let locked_hasher = existing_lock.hash_strategy(target.install_path())?;
+        let locked_hasher =
+            existing_lock.hash_strategy(target.install_path(), &FxHashSet::default())?;
         let build_hasher = HashStrategy::from_constraints(
             &existing_lock.build_constraints(target.install_path()),
             Some(&interpreter.to_resolver_marker_environment()),
@@ -852,12 +860,21 @@ async fn do_lock(
     } else {
         (HashStrategy::default(), HashStrategy::default())
     };
-    // A fresh resolution retains those hashes under `--locked`, but an explicitly unlocked update
-    // must be able to replace them. Build dependencies follow the same choice without generating
-    // hashes for artifacts absent from the lockfile.
-    let resolution_hasher = match mode {
-        LockMode::Locked(..) => &locked_hasher,
-        LockMode::Write(_) | LockMode::DryRun(_) | LockMode::Frozen(_) => &HashStrategy::default(),
+    // Re-resolving an outdated lock does not authorize replacing known artifacts. Only an
+    // explicit unlocked upgrade releases the selected packages' hashes.
+    let hash_upgrade = match mode {
+        LockMode::Locked(..) => &Upgrade::default(),
+        LockMode::Write(_) | LockMode::DryRun(_) | LockMode::Frozen(_) => upgrade,
+    };
+    let resolution_hasher = if hash_upgrade.is_none() {
+        locked_hasher.clone()
+    } else if let Some(existing_lock) = existing_lock.as_ref() {
+        // An explicit upgrade allows replacing the selected packages' files, so do not require
+        // them to match the hashes recorded in the lockfile.
+        let upgrade_packages = existing_lock.upgrade_packages(hash_upgrade);
+        existing_lock.hash_strategy(target.install_path(), &upgrade_packages)?
+    } else {
+        HashStrategy::default()
     };
     let hasher = HashStrategy::collect(HashCollection::Url)
         .with_verification(resolution_hasher.verification().clone());
@@ -1160,7 +1177,20 @@ async fn do_lock(
                 preview.is_enabled(PreviewFeature::LockWithoutMetadata),
             )?
             .with_conflicts(conflicts)
-            .with_required_environments(lock_required_environments.into_markers());
+            .with_required_environments(lock_required_environments.into_markers())
+            .with_member_default_groups(
+                packages
+                    .iter()
+                    .filter_map(|(name, member)| {
+                        member
+                            .pyproject_toml()
+                            .configured_default_groups()
+                            .cloned()
+                            .map(|groups| (name.clone(), groups))
+                    })
+                    .collect(),
+            )
+            .with_member_group_metadata(packages)?;
 
             let lock = if let Some(recorder) = recorder {
                 lock.prune_unused(recorder.take())
@@ -1462,6 +1492,20 @@ impl ValidatedLock {
             SatisfiesResult::MismatchedMembers(expected, actual) => {
                 debug!(
                     "Resolving despite existing lockfile due to mismatched members:\n  Requested: {:?}\n  Existing: {:?}",
+                    expected, actual
+                );
+                Ok(Self::Preferable(lock))
+            }
+            SatisfiesResult::MismatchedMemberDefaultGroups(expected, actual) => {
+                debug!(
+                    "Resolving despite existing lockfile due to mismatched member default groups:\n  Requested: {:?}\n  Existing: {:?}",
+                    expected, actual
+                );
+                Ok(Self::Preferable(lock))
+            }
+            SatisfiesResult::MismatchedMemberGroupMetadata(expected, actual) => {
+                debug!(
+                    "Resolving despite existing lockfile due to mismatched group metadata:\n  Requested: {:?}\n  Existing: {:?}",
                     expected, actual
                 );
                 Ok(Self::Preferable(lock))

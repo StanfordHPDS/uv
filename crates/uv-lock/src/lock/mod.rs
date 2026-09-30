@@ -21,11 +21,12 @@ use url::Url;
 
 use uv_cache_key::RepositoryUrl;
 use uv_configuration::{
-    BuildOptions, Constraints, DependencyGroupsWithDefaults, ExcludeDependency, ExcludeNewer,
-    ExcludeNewerPackage, Excludes, ExtrasSpecificationWithDefaults, ForkStrategy, InstallTarget,
-    NormalizedConstraints, NormalizedExcludes, NormalizedOverrideEntries, NormalizedRequirements,
-    Override, Overrides, PackageOverride, Prerelease, PrereleaseMode, PrereleasePackage,
-    ResolutionMode, ScopedOverrideSourceError,
+    BuildOptions, Constraints, DependencyGroupsWithDefaults, DependencyModifierScope,
+    DependencyModifiers, ExcludeDependency, ExcludeNewer, ExcludeNewerPackage, Excludes,
+    ExtrasSpecificationWithDefaults, ForkStrategy, InstallTarget, NormalizedConstraints,
+    NormalizedExcludes, NormalizedOverrideEntries, NormalizedRequirements, Override, Overrides,
+    PackageOverride, Prerelease, PrereleaseMode, PrereleasePackage, ResolutionMode,
+    ScopedOverrideSourceError, Upgrade,
 };
 use uv_distribution::{
     DistributionDatabase, FlatRequiresDist, Metadata as DistributionMetadata, RequiresDist,
@@ -46,7 +47,7 @@ use uv_distribution_types::{
 use uv_fs::{PortablePath, PortablePathBuf, Simplified, normalize_path, try_relative_to_if};
 use uv_git::{RepositoryReference, ResolvedRepositoryReference};
 use uv_git_types::{GitLfs, GitOid, GitReference, GitUrl, GitUrlParseError};
-use uv_normalize::{ExtraName, GroupName, PackageName};
+use uv_normalize::{DEV_DEPENDENCIES, DefaultGroups, ExtraName, GroupName, PackageName};
 use uv_pep440::{Version, VersionSpecifiers};
 use uv_pep508::{
     MarkerEnvironment, MarkerTree, Scheme, VerbatimUrl, VerbatimUrlError, split_scheme,
@@ -67,6 +68,7 @@ use uv_resolver_types::{
 use uv_small_str::SmallString;
 use uv_types::{BuildContext, HashStrategy};
 use uv_warnings::warn_user_once;
+use uv_workspace::dependency_groups::{DependencyGroupError, FlatDependencyGroups};
 use uv_workspace::{Editability, WorkspaceMember};
 
 pub use crate::lock::deserialize::Error as CanonicalLockError;
@@ -117,10 +119,21 @@ pub enum LockParseError {
 }
 
 /// The current revision of the lockfile format.
-const REVISION: u32 = 3;
+///
+/// Version 1 revisions:
+/// - 0: The original format; a missing `revision` is read as 0.
+/// - 1: Record `provides-extras` and empty dependency group metadata.
+/// - 2: Record distribution upload times.
+/// - 3: Record package-specific `exclude-newer` values.
+/// - 4: Support omitting package declaration metadata and record empty extras and groups.
+/// - 5: Record workspace member default groups and dependency group metadata.
+const REVISION: u32 = 5;
 
-/// The first lockfile revision that supports omitting package declaration metadata.
-const METADATA_FREE_REVISION: u32 = 4;
+/// The first lockfile revision that records workspace member default groups.
+const MEMBER_DEFAULT_GROUPS_REVISION: u32 = 5;
+
+/// The first lockfile revision that records workspace member dependency group metadata.
+const MEMBER_GROUP_METADATA_REVISION: u32 = 5;
 
 static LINUX_MARKERS: LazyLock<UniversalMarker> = LazyLock::new(|| {
     let pep508 = MarkerTree::from_str("os_name == 'posix' and sys_platform == 'linux'").unwrap();
@@ -1638,8 +1651,7 @@ impl<'lock> ExpectedPackageDependencies<'lock> {
         provides_extra: &'lock [ExtraName],
         dependency_groups: &BTreeMap<GroupName, BTreeSet<Requirement>>,
         source_requirements: &'lock DependencySources<'lock>,
-        overrides: &Overrides,
-        excludes: &Excludes,
+        modifiers: &DependencyModifiers,
         package_requires_python: Option<&VersionSpecifiers>,
         package_version: Option<&Version>,
         package: &'lock Package,
@@ -1648,14 +1660,19 @@ impl<'lock> ExpectedPackageDependencies<'lock> {
         declarations_preprocessed: bool,
     ) -> Self {
         let package_context = package_version.map(|version| (&package.id.name, version));
+        let package_scope = package_context
+            .map_or(DependencyModifierScope::Global, |(name, version)| {
+                DependencyModifierScope::Package(name, version)
+            });
+        let dependency_group_scope = package_context
+            .map_or(DependencyModifierScope::Global, |(name, version)| {
+                DependencyModifierScope::DependencyGroup(name, version)
+            });
         let declarations = if declarations_preprocessed {
             declarations.clone()
         } else {
-            overrides
-                .apply_for_package(package_context, declarations)
-                .filter(|requirement| {
-                    !excludes.contains_for_package(package_context, &requirement.name)
-                })
+            modifiers
+                .apply(package_scope, declarations)
                 .map(Cow::into_owned)
                 .collect::<BTreeSet<_>>()
         };
@@ -1664,11 +1681,8 @@ impl<'lock> ExpectedPackageDependencies<'lock> {
             .map(|(group, requirements)| {
                 // Groups inherit global overrides but are not distribution dependencies, so
                 // overrides scoped to the owning package must not rewrite their requirements.
-                let requirements = overrides
-                    .apply_for_package(None, requirements)
-                    .filter(|requirement| {
-                        !excludes.contains_for_package(package_context, &requirement.name)
-                    })
+                let requirements = modifiers
+                    .apply(dependency_group_scope, requirements)
                     .map(Cow::into_owned)
                     .collect::<BTreeSet<_>>();
                 (group.clone(), requirements)
@@ -2630,6 +2644,11 @@ impl Lock {
             vec![],
             fork_markers,
         )?;
+        let lock = if uv_preview::is_enabled(PreviewFeature::ResolutionInputs) {
+            lock.prune_constraints()
+        } else {
+            lock
+        };
         Ok(if metadata_free {
             lock.without_package_metadata()
         } else {
@@ -2803,13 +2822,33 @@ impl Lock {
         self
     }
 
+    /// Record the default groups for workspace members in a revision 5 or newer lockfile.
+    ///
+    /// The implicit `["dev"]` default is omitted, and group lists are sorted and deduplicated.
+    #[must_use]
+    pub fn with_member_default_groups(
+        mut self,
+        groups: BTreeMap<PackageName, DefaultGroups>,
+    ) -> Self {
+        self.manifest.default_groups = canonicalize_member_default_groups(groups);
+        self
+    }
+
+    /// Record member group metadata, including Python requirements inherited from included groups.
+    pub fn with_member_group_metadata(
+        mut self,
+        packages: &BTreeMap<PackageName, WorkspaceMember>,
+    ) -> Result<Self, LockError> {
+        self.manifest.group_metadata = collect_member_group_metadata(packages)?;
+        Ok(self)
+    }
+
     /// Omit package metadata except for remote URL and Git dependencies.
     ///
     /// Local declarations can be reread from disk. Remote URL and Git declarations remain in the
     /// lockfile so freshness checks can determine offline whether a source is requested or stale.
     #[must_use]
     fn without_package_metadata(mut self) -> Self {
-        self.revision = METADATA_FREE_REVISION;
         let workspace_root = self.root().map(|package| package.id.clone());
         for package in &mut self.packages {
             if matches!(package.id.source, Source::Direct(..) | Source::Git(..)) {
@@ -2860,11 +2899,6 @@ impl Lock {
         (self.version(), self.revision()) >= (1, 1)
     }
 
-    /// Returns `true` if this [`Lock`] can validate packages without declaration metadata.
-    pub fn supports_missing_package_metadata(&self) -> bool {
-        (self.version(), self.revision()) >= (VERSION, METADATA_FREE_REVISION)
-    }
-
     /// Returns `true` if this [`Lock`] includes entries for empty `dependency-group` metadata.
     fn includes_empty_groups(&self) -> bool {
         // Empty dependency groups are included as of https://github.com/astral-sh/uv/pull/8598,
@@ -2897,14 +2931,63 @@ impl Lock {
         &self.packages
     }
 
+    /// Resolve package and dependency-group upgrade selections against this lockfile.
+    pub fn upgrade_packages(&self, upgrade: &Upgrade) -> FxHashSet<PackageName> {
+        if upgrade.is_all() {
+            return self
+                .packages
+                .iter()
+                .map(|package| package.name().clone())
+                .collect();
+        }
+
+        // Resolve the full set of packages to upgrade, combining `--upgrade-package` and
+        // `--upgrade-group`.
+        let mut upgrade_packages = upgrade.packages().cloned().unwrap_or_default();
+        if upgrade.packages().is_some()
+            && let Some(groups) = upgrade.groups()
+        {
+            // Check package-level dependency groups (the standard case for projects with
+            // a `[project]` table).
+            for package in self.packages() {
+                for (group_name, dependencies) in package.resolved_dependency_groups() {
+                    if groups.contains(group_name) {
+                        for dependency in dependencies {
+                            upgrade_packages.insert(dependency.package_name().clone());
+                        }
+                    }
+                }
+            }
+
+            // Check manifest-level dependency groups, which cover projects without a
+            // `[project]` table (e.g., virtual workspace roots or PEP 723 scripts).
+            for (group_name, requirements) in self.dependency_groups() {
+                if groups.contains(group_name) {
+                    for requirement in requirements {
+                        upgrade_packages.insert(requirement.name.clone());
+                    }
+                }
+            }
+        }
+
+        upgrade_packages
+    }
+
     /// Return a [`HashStrategy`] that verifies artifacts recorded in this lockfile.
     ///
-    /// Artifacts absent from the lockfile do not require hashes. This strategy does not generate
-    /// hashes for those artifacts.
-    pub fn hash_strategy(&self, root: &Path) -> Result<HashStrategy, LockError> {
+    /// Registry hashes apply to package names and versions; direct archive hashes apply to URLs
+    /// or paths. Packages in `excluded_packages` are skipped. This strategy does not generate hashes.
+    pub fn hash_strategy(
+        &self,
+        root: &Path,
+        excluded_packages: &FxHashSet<PackageName>,
+    ) -> Result<HashStrategy, LockError> {
         let mut hashes: FxHashMap<VersionId, Vec<HashDigest>> = FxHashMap::default();
 
         for package in &self.packages {
+            if excluded_packages.contains(package.name()) {
+                continue;
+            }
             let (id, package_hashes) = match &package.id.source {
                 Source::Registry(_) => {
                     let Some(version) = &package.id.version else {
@@ -3036,6 +3119,47 @@ impl Lock {
         &self.manifest.members
     }
 
+    /// Return the recorded default groups for workspace members, if supported by the lockfile.
+    ///
+    /// uv-generated lockfiles omit entries for the standard `dev` default.
+    pub fn configured_member_default_groups(
+        &self,
+    ) -> Option<&BTreeMap<PackageName, DefaultGroups>> {
+        ((self.version(), self.revision()) >= (VERSION, MEMBER_DEFAULT_GROUPS_REVISION))
+            .then_some(&self.manifest.default_groups)
+    }
+
+    /// Return the dependency group metadata recorded for workspace members.
+    ///
+    /// `None` means the lockfile predates this metadata; an absent group in a returned map has no
+    /// group-specific metadata.
+    pub fn member_group_metadata(
+        &self,
+    ) -> Option<&BTreeMap<PackageName, BTreeMap<GroupName, GroupMetadata>>> {
+        ((self.version(), self.revision()) >= (VERSION, MEMBER_GROUP_METADATA_REVISION))
+            .then_some(&self.manifest.group_metadata)
+    }
+
+    /// Return a workspace member's default groups, assuming `dev` when not recorded.
+    ///
+    /// Returns `None` if the lockfile predates this metadata or the name is not a workspace member.
+    /// A single-project lockfile's root counts as a member even when the workspace member list is
+    /// omitted.
+    pub fn member_default_groups(&self, name: &PackageName) -> Option<DefaultGroups> {
+        let default_groups = self.configured_member_default_groups()?;
+        if !(self.members().contains(name)
+            || self.members().is_empty() && self.root().is_some_and(|root| root.name() == name))
+        {
+            return None;
+        }
+        Some(
+            default_groups
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| DefaultGroups::List(vec![DEV_DEPENDENCIES.clone()])),
+        )
+    }
+
     /// Returns `true` if the package is a workspace member.
     fn is_workspace_member(&self, package: &Package) -> bool {
         self.members().contains(&package.id.name)
@@ -3069,7 +3193,7 @@ impl Lock {
     }
 
     /// Returns the dependency groups that were used to generate this lock.
-    pub fn dependency_groups(&self) -> &BTreeMap<GroupName, BTreeSet<Requirement>> {
+    fn dependency_groups(&self) -> &BTreeMap<GroupName, BTreeSet<Requirement>> {
         &self.manifest.dependency_groups
     }
 
@@ -3734,8 +3858,7 @@ impl Lock {
         provides_extra: &[ExtraName],
         dependency_groups: BTreeMap<GroupName, Box<[Requirement]>>,
         source_requirements: &DependencySources<'_>,
-        overrides: &Overrides,
-        excludes: &Excludes,
+        modifiers: &DependencyModifiers,
         package_requires_python: Option<&VersionSpecifiers>,
         package_version: Option<&Version>,
         package: &'lock Package,
@@ -3767,8 +3890,7 @@ impl Lock {
                     package_version,
                     &requires_dist,
                     DependencyContext::Production,
-                    overrides,
-                    excludes,
+                    modifiers,
                 )
             } else {
                 FlatRequiresDist::from_requirements(requires_dist.clone(), &package.id.name)
@@ -3845,8 +3967,7 @@ impl Lock {
                 provides_extra,
                 &expected_groups,
                 source_requirements,
-                overrides,
-                excludes,
+                modifiers,
                 package_requires_python,
                 package_version,
                 package,
@@ -4032,8 +4153,6 @@ impl Lock {
         database: &DistributionDatabase<'_, Context>,
         allow_missing_package_metadata: bool,
     ) -> Result<SatisfiesResult<'_>, LockError> {
-        let allow_missing_package_metadata =
-            allow_missing_package_metadata && self.supports_missing_package_metadata();
         let mut queue: VecDeque<PackageIndex> = VecDeque::new();
         let mut seen = FxHashSet::default();
         let mut activated_extras: FxHashMap<PackageId, BTreeMap<ExtraName, UniversalMarker>> =
@@ -4047,6 +4166,46 @@ impl Lock {
             let actual = &self.manifest.members;
             if expected != *actual {
                 return Ok(SatisfiesResult::MismatchedMembers(expected, actual));
+            }
+        }
+
+        // Older lockfiles did not record defaults, so they remain valid without this check.
+        if let Some(actual) = self.configured_member_default_groups() {
+            let expected = canonicalize_member_default_groups(
+                packages
+                    .iter()
+                    .filter_map(|(name, member)| {
+                        member
+                            .pyproject_toml()
+                            .configured_default_groups()
+                            .cloned()
+                            .map(|groups| (name.clone(), groups))
+                    })
+                    .collect(),
+            );
+            let actual = canonicalize_member_default_groups(actual.clone());
+            if expected != actual {
+                return Ok(SatisfiesResult::MismatchedMemberDefaultGroups(
+                    expected, actual,
+                ));
+            }
+        }
+
+        if let Some(actual) = self.member_group_metadata() {
+            let expected = collect_member_group_metadata(packages)?;
+            if expected != *actual {
+                // Unknown fields can leave a group with no known metadata. Such entries are
+                // equivalent to an absent group for the settings this version understands.
+                let mut canonical = actual.clone();
+                canonical.retain(|_, groups| {
+                    groups.retain(|_, metadata| *metadata != GroupMetadata::default());
+                    !groups.is_empty()
+                });
+                if expected != canonical {
+                    return Ok(SatisfiesResult::MismatchedMemberGroupMetadata(
+                        expected, actual,
+                    ));
+                }
             }
         }
 
@@ -4102,15 +4261,25 @@ impl Lock {
         }
 
         let filter = ManifestFilter::from_lock(self);
+        let omit_constraints = uv_preview::is_enabled(PreviewFeature::ResolutionInputs);
 
         let normalized_constraints = {
             let expected = normalizer.constraints(
                 constraints
                     .iter()
-                    .filter(|entry| filter.includes_constraint(entry))
+                    .filter(|entry| {
+                        filter.includes_constraint(entry)
+                            && (!omit_constraints || !self.can_omit_constraint(entry))
+                    })
                     .cloned(),
             )?;
-            let actual = normalizer.constraints(self.manifest.constraints.iter().cloned())?;
+            let actual = normalizer.constraints(
+                self.manifest
+                    .constraints
+                    .iter()
+                    .filter(|entry| !omit_constraints || !self.can_omit_constraint(entry))
+                    .cloned(),
+            )?;
             if expected != actual {
                 return Ok(SatisfiesResult::MismatchedConstraints(
                     expected.into_iter().collect(),
@@ -4239,37 +4408,31 @@ impl Lock {
             }
         }
 
-        let dependency_overrides = if allow_missing_package_metadata {
-            Overrides::from_entries(normalized_overrides)
-                .map_err(LockErrorKind::InvalidScopedOverride)?
+        let dependency_modifiers = if allow_missing_package_metadata {
+            DependencyModifiers::new(
+                Overrides::from_entries(normalized_overrides)
+                    .map_err(LockErrorKind::InvalidScopedOverride)?,
+                Excludes::from_entries(excludes.iter().cloned()),
+            )
         } else {
-            Overrides::default()
-        };
-        let dependency_excludes = if allow_missing_package_metadata {
-            Excludes::from_entries(excludes.iter().cloned())
-        } else {
-            Excludes::default()
+            DependencyModifiers::default()
         };
         // Projectless workspace groups and scripts are root declarations, so apply only
         // global overrides and exclusions before using them for sources or validation.
-        let root_requirements = dependency_overrides
-            .apply_for_package(
-                None,
+        let root_requirements = dependency_modifiers
+            .apply(
+                DependencyModifierScope::Global,
                 requirements
                     .iter()
                     .chain(dependency_groups.values().flatten()),
             )
-            .filter(|requirement| {
-                !dependency_excludes.contains_for_package(None, &requirement.name)
-            })
             .collect::<Vec<_>>();
         let dependency_sources = if allow_missing_package_metadata {
             Box::pin(self.collect_dependency_sources(
                 normalized_constraints,
                 &root_requirements,
                 dependency_metadata,
-                &dependency_overrides,
-                &dependency_excludes,
+                &dependency_modifiers,
                 root,
                 tags,
                 markers,
@@ -4517,8 +4680,7 @@ impl Lock {
                             &metadata.provides_extra,
                             metadata.dependency_groups,
                             &dependency_sources,
-                            &dependency_overrides,
-                            &dependency_excludes,
+                            &dependency_modifiers,
                             requires_python.as_ref(),
                             Some(version),
                             package,
@@ -4584,8 +4746,7 @@ impl Lock {
                         &metadata.provides_extra,
                         metadata.dependency_groups,
                         &dependency_sources,
-                        &dependency_overrides,
-                        &dependency_excludes,
+                        &dependency_modifiers,
                         metadata.requires_python.as_ref(),
                         Some(&metadata.version),
                         package,
@@ -4609,9 +4770,7 @@ impl Lock {
                 // even if the version is dynamic, we can still extract the requirements without
                 // performing a build, unlike in the database where we typically construct a "complete"
                 // metadata object.
-                let metadata = if dependency_overrides.has_scoped_package(&package.id.name)
-                    || dependency_excludes.has_scoped_package(&package.id.name)
-                {
+                let metadata = if dependency_modifiers.has_scoped_package(&package.id.name) {
                     // Package-scoped rules depend on the actual dynamic version, which is only
                     // available from the built distribution metadata.
                     None
@@ -4655,8 +4814,7 @@ impl Lock {
                         &metadata.provides_extra,
                         metadata.dependency_groups,
                         &dependency_sources,
-                        &dependency_overrides,
-                        &dependency_excludes,
+                        &dependency_modifiers,
                         requires_python.as_ref(),
                         None,
                         package,
@@ -4721,8 +4879,7 @@ impl Lock {
                         &metadata.provides_extra,
                         metadata.dependency_groups,
                         &dependency_sources,
-                        &dependency_overrides,
-                        &dependency_excludes,
+                        &dependency_modifiers,
                         metadata.requires_python.as_ref(),
                         Some(&metadata.version),
                         package,
@@ -4837,19 +4994,19 @@ impl Lock {
         package_version: Option<&Version>,
         requirements: &[Requirement],
         context: DependencyContext<'_>,
-        overrides: &Overrides,
-        excludes: &Excludes,
+        modifiers: &DependencyModifiers,
     ) -> Vec<Requirement> {
-        let package_context = package_version.map(|version| (package_name, version));
-        let override_context = match context {
-            DependencyContext::Group(_) => None,
-            DependencyContext::Production | DependencyContext::Extra(_) => package_context,
-        };
-        let requirements = overrides
-            .apply_for_package(override_context, requirements)
-            .filter(|requirement| {
-                !excludes.contains_for_package(package_context, &requirement.name)
-            })
+        let scope =
+            package_version.map_or(DependencyModifierScope::Global, |version| match context {
+                DependencyContext::Group(_) => {
+                    DependencyModifierScope::DependencyGroup(package_name, version)
+                }
+                DependencyContext::Production | DependencyContext::Extra(_) => {
+                    DependencyModifierScope::Package(package_name, version)
+                }
+            });
+        let requirements = modifiers
+            .apply(scope, requirements)
             .map(Cow::into_owned)
             .collect::<Box<[_]>>();
 
@@ -4871,8 +5028,7 @@ impl Lock {
         requirements: &[Requirement],
         group: Option<&GroupName>,
         package_markers: &PackageMarkers<'_>,
-        dependency_overrides: &Overrides,
-        dependency_excludes: &Excludes,
+        dependency_modifiers: &DependencyModifiers,
         root: &Path,
         source_requirements: &mut BTreeSet<Requirement>,
         pending_sources: &mut Vec<Requirement>,
@@ -4890,8 +5046,7 @@ impl Lock {
             group
                 .map(DependencyContext::Group)
                 .unwrap_or(DependencyContext::Production),
-            dependency_overrides,
-            dependency_excludes,
+            dependency_modifiers,
         );
 
         for requirement in requirements {
@@ -4943,8 +5098,7 @@ impl Lock {
         reachability: &mut DependencySourceReachability<'lock>,
         source_requirements: &BTreeSet<Requirement>,
         dependency_metadata: &DependencyMetadata,
-        dependency_overrides: &Overrides,
-        dependency_excludes: &Excludes,
+        dependency_modifiers: &DependencyModifiers,
         root: &Path,
         tags: &Tags,
         markers: &MarkerEnvironment,
@@ -4990,8 +5144,7 @@ impl Lock {
                     && metadata
                         .as_ref()
                         .is_none_or(|metadata| metadata.version.is_none())
-                    && (dependency_overrides.has_scoped_package(&package.id.name)
-                        || dependency_excludes.has_scoped_package(&package.id.name))
+                    && dependency_modifiers.has_scoped_package(&package.id.name)
                 {
                     // Scoped rules need the resolved version before this authorized tree can
                     // expose any dependency sources.
@@ -5089,8 +5242,7 @@ impl Lock {
                         version.as_ref(),
                         &requirements,
                         requirement_context,
-                        dependency_overrides,
-                        dependency_excludes,
+                        dependency_modifiers,
                     );
                     for requirement in requirements {
                         let requirement_marker =
@@ -5270,8 +5422,7 @@ impl Lock {
         mut source_requirements: BTreeSet<Requirement>,
         root_requirements: &[Cow<'_, Requirement>],
         dependency_metadata: &DependencyMetadata,
-        dependency_overrides: &Overrides,
-        dependency_excludes: &Excludes,
+        dependency_modifiers: &DependencyModifiers,
         root: &Path,
         tags: &Tags,
         markers: &MarkerEnvironment,
@@ -5283,12 +5434,9 @@ impl Lock {
     ) -> Result<DependencySources<'_>, LockError> {
         // Global URL overrides authorize sources and replace competing URL constraints.
         // Scoped overrides cannot grant this privilege, and excluded packages stay inactive.
-        let global_source_overrides = dependency_overrides
-            .global_requirements()
-            .filter(|requirement| {
-                !matches!(requirement.source, RequirementSource::Registry { .. })
-                    && !dependency_excludes.contains(&requirement.name)
-            })
+        let global_source_overrides = dependency_modifiers
+            .global_overrides()
+            .filter(|requirement| !matches!(requirement.source, RequirementSource::Registry { .. }))
             .cloned()
             .collect::<Vec<_>>();
         if !global_source_overrides.is_empty() {
@@ -5371,8 +5519,7 @@ impl Lock {
             &mut reachability,
             &source_candidates,
             dependency_metadata,
-            dependency_overrides,
-            dependency_excludes,
+            dependency_modifiers,
             root,
             tags,
             markers,
@@ -5494,8 +5641,7 @@ impl Lock {
                         &mut reachability,
                         &source_candidates,
                         dependency_metadata,
-                        dependency_overrides,
-                        dependency_excludes,
+                        dependency_modifiers,
                         root,
                         tags,
                         markers,
@@ -5623,8 +5769,7 @@ impl Lock {
                 &direct_requirements,
                 None,
                 &reachability.package_markers,
-                dependency_overrides,
-                dependency_excludes,
+                dependency_modifiers,
                 root,
                 &mut source_requirements,
                 &mut pending_sources,
@@ -5638,8 +5783,7 @@ impl Lock {
                     &requirements,
                     Some(&group),
                     &reachability.package_markers,
-                    dependency_overrides,
-                    dependency_excludes,
+                    dependency_modifiers,
                     root,
                     &mut source_requirements,
                     &mut pending_sources,
@@ -5878,6 +6022,16 @@ pub enum SatisfiesResult<'lock> {
     Satisfied,
     /// The lockfile uses a different set of workspace members.
     MismatchedMembers(BTreeSet<PackageName>, &'lock BTreeSet<PackageName>),
+    /// The lockfile records different default groups for workspace members.
+    MismatchedMemberDefaultGroups(
+        BTreeMap<PackageName, DefaultGroups>,
+        BTreeMap<PackageName, DefaultGroups>,
+    ),
+    /// The lockfile records different dependency group metadata.
+    MismatchedMemberGroupMetadata(
+        BTreeMap<PackageName, BTreeMap<GroupName, GroupMetadata>>,
+        &'lock BTreeMap<PackageName, BTreeMap<GroupName, GroupMetadata>>,
+    ),
     /// A workspace member switched from virtual to non-virtual or vice versa.
     MismatchedVirtual(PackageName, bool),
     /// A workspace member switched from editable to non-editable or vice versa.
@@ -6050,6 +6204,12 @@ pub struct ResolverManifest {
     /// The workspace members included in the lockfile.
     #[serde(default)]
     members: BTreeSet<PackageName>,
+    /// Nonstandard default dependency groups configured by workspace members.
+    #[serde(default)]
+    default_groups: BTreeMap<PackageName, DefaultGroups>,
+    /// Metadata for dependency groups of workspace members.
+    #[serde(default)]
+    group_metadata: BTreeMap<PackageName, BTreeMap<GroupName, GroupMetadata>>,
     /// The requirements provided to the resolver, exclusive of the workspace members.
     ///
     /// These are requirements that are attached to the project, but not to any of its
@@ -6080,6 +6240,58 @@ pub struct ResolverManifest {
     dependency_metadata: BTreeSet<StaticMetadata>,
 }
 
+/// Sort and deduplicate group lists, omitting entries equivalent to the implicit `dev` default.
+fn canonicalize_member_default_groups(
+    mut groups: BTreeMap<PackageName, DefaultGroups>,
+) -> BTreeMap<PackageName, DefaultGroups> {
+    groups.retain(|_, groups| {
+        if let DefaultGroups::List(groups) = groups {
+            groups.sort_unstable();
+            groups.dedup();
+            groups.as_slice() != [DEV_DEPENDENCIES.clone()]
+        } else {
+            true
+        }
+    });
+    groups
+}
+
+/// Metadata for a workspace member's dependency group.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct GroupMetadata {
+    /// The effective Python requirement, including requirements from included groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_python: Option<VersionSpecifiers>,
+}
+
+/// Collect metadata for each member's dependency groups.
+fn collect_member_group_metadata(
+    packages: &BTreeMap<PackageName, WorkspaceMember>,
+) -> Result<BTreeMap<PackageName, BTreeMap<GroupName, GroupMetadata>>, DependencyGroupError> {
+    let mut members = BTreeMap::new();
+    for (name, member) in packages {
+        let groups =
+            FlatDependencyGroups::from_pyproject_toml(member.root(), member.pyproject_toml())?
+                .into_iter()
+                .filter_map(|(group, flat)| {
+                    flat.requires_python.map(|requires_python| {
+                        (
+                            group,
+                            GroupMetadata {
+                                requires_python: Some(requires_python),
+                            },
+                        )
+                    })
+                })
+                .collect::<BTreeMap<_, _>>();
+        if !groups.is_empty() {
+            members.insert(name.clone(), groups);
+        }
+    }
+    Ok(members)
+}
+
 impl ResolverManifest {
     /// Initialize a [`ResolverManifest`] with the given members, requirements, constraints, and
     /// overrides.
@@ -6096,11 +6308,17 @@ impl ResolverManifest {
         let normalize = uv_preview::is_enabled(PreviewFeature::LockfileNormalization);
         Self {
             members: members.into_iter().collect(),
+            default_groups: BTreeMap::new(),
+            group_metadata: BTreeMap::new(),
             requirements: normalize_collection::<_, NormalizedRequirements>(
                 requirements,
                 normalize,
             ),
-            constraints: normalize_collection::<_, NormalizedConstraints>(constraints, normalize),
+            // Prune individual constraints before combining their bounds in preview mode.
+            constraints: normalize_collection::<_, NormalizedConstraints>(
+                constraints,
+                normalize && !uv_preview::is_enabled(PreviewFeature::ResolutionInputs),
+            ),
             overrides: normalize_collection::<_, NormalizedOverrideEntries>(overrides, normalize),
             excludes: normalize_collection::<_, NormalizedExcludes>(excludes, normalize),
             build_constraints: build_constraints.into_iter().collect(),
@@ -6121,6 +6339,8 @@ impl ResolverManifest {
     pub fn relative_to(self, root: &Path) -> Result<Self, io::Error> {
         Ok(Self {
             members: self.members,
+            default_groups: self.default_groups,
+            group_metadata: self.group_metadata,
             requirements: self
                 .requirements
                 .into_iter()
@@ -9477,6 +9697,9 @@ impl std::fmt::Display for WheelTagHint {
 /// is with the caller somewhere in such cases.
 #[derive(Debug, thiserror::Error)]
 enum LockErrorKind {
+    /// An error that occurs when collecting dependency-group settings.
+    #[error(transparent)]
+    DependencyGroups(#[from] DependencyGroupError),
     /// An error that occurs when the overrides for validating a
     /// metadata-free lockfile cannot be scoped to their packages.
     #[error(transparent)]
@@ -10326,7 +10549,9 @@ wheels = [{ filename = "local-1.0.0-py3-none-any.whl", hash = "sha256:53a42340ae
         )
         .expect("valid lock");
         let root = std::env::current_dir().expect("current directory");
-        let hasher = lock.hash_strategy(&root).expect("valid source paths");
+        let hasher = lock
+            .hash_strategy(&root, &FxHashSet::default())
+            .expect("valid source paths");
         let digest = HashDigest::from_str(
             "sha256:53a42340ae36747fb1471f9b4b7958be1f6e2e5fc234f931aafa3e454fd31dfb",
         )
