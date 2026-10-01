@@ -1269,6 +1269,125 @@ fn mixed_requires_python() -> Result<()> {
     Ok(())
 }
 
+/// Non-project root groups constrain Python selection, including inherited group requirements.
+#[test]
+fn non_project_group_requires_python() -> Result<()> {
+    let context = uv_test::test_context_with_versions!(&["3.11", "3.12"]);
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+        [tool.uv.workspace]
+        members = ["member"]
+
+        [tool.uv]
+        default-groups = ["docs"]
+
+        [dependency-groups]
+        test = []
+        docs = [{ include-group = "test" }]
+        lint = []
+
+        [tool.uv.dependency-groups]
+        test = { requires-python = ">=3.12" }
+        docs = { requires-python = "<3.13" }
+        lint = { requires-python = ">=3.13" }
+    "#})?;
+    context
+        .temp_dir
+        .child("member/pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "member"
+        version = "1.0.0"
+        requires-python = ">=3.11"
+
+        [tool.uv]
+        package = false
+        default-groups = ["lint"]
+
+        [dependency-groups]
+        lint = []
+        test = []
+    "#})?;
+    context
+        .lock()
+        .args(["--python", "3.11", "--offline"])
+        .assert()
+        .success();
+
+    // Default groups select Python 3.12 even though the workspace permits Python 3.11.
+    uv_snapshot!(context.filters(), context.sync().args(["--offline", "--dry-run"]), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
+    Would create project environment at: .venv
+    Resolved 1 package in [TIME]
+    Found up-to-date lockfile at: uv.lock
+    Checked in [TIME]
+    Would make no changes
+    ");
+    uv_snapshot!(context.filters(), context.sync().args(["--python", "3.11", "--offline", "--dry-run"]), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    Using CPython 3.11.[X] interpreter at: [PYTHON-3.11]
+    error: The requested interpreter resolved to Python 3.11.[X], which is incompatible with the project's Python requirement: `==3.12.*` (from the workspace root's `tool.uv.dependency-groups.docs.requires-python`).
+    ");
+    uv_snapshot!(context.filters(), context.sync().args(["--no-default-groups", "--python", "3.11", "--offline", "--dry-run"]), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Using CPython 3.11.[X] interpreter at: [PYTHON-3.11]
+    Would create project environment at: .venv
+    Resolved 1 package in [TIME]
+    Found up-to-date lockfile at: uv.lock
+    Checked in [TIME]
+    Would make no changes
+    ");
+
+    // Explicit root groups also constrain `run` and frozen member sync.
+    uv_snapshot!(context.filters(), context.run().args(["--no-default-groups", "--group", "docs", "--python", "3.11", "--offline", "--", "python", "-V"]), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    Using CPython 3.11.[X] interpreter at: [PYTHON-3.11]
+    error: The requested interpreter resolved to Python 3.11.[X], which is incompatible with the project's Python requirement: `==3.12.*` (from the workspace root's `tool.uv.dependency-groups.docs.requires-python`).
+    ");
+    uv_snapshot!(context.filters(), context.sync().args(["--frozen", "--package", "member", "--group", "docs", "--python", "3.11", "--offline", "--dry-run"]), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    Using CPython 3.11.[X] interpreter at: [PYTHON-3.11]
+    error: The requested interpreter resolved to Python 3.11.[X], which is incompatible with the project's Python requirement: `==3.12.*` (from `workspace:docs` in `uv.lock`).
+    ");
+
+    // A member's defaults and same-named groups do not activate the root's requirements.
+    uv_snapshot!(context.filters(), context.sync().args(["--frozen", "--package", "member", "--python", "3.11", "--offline", "--dry-run"]), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Using CPython 3.11.[X] interpreter at: [PYTHON-3.11]
+    Would create project environment at: .venv
+    Checked in [TIME]
+    Would make no changes
+    ");
+    uv_snapshot!(context.filters(), context.sync().args(["--frozen", "--package", "member", "--group", "test", "--python", "3.11", "--offline", "--dry-run"]), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Using CPython 3.11.[X] interpreter at: [PYTHON-3.11]
+    Would create project environment at: .venv
+    Checked in [TIME]
+    Would make no changes
+    ");
+
+    // Conflicting root requirements identify both group declarations.
+    uv_snapshot!(context.filters(), context.sync().args(["--group", "lint", "--offline", "--dry-run"]), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Found conflicting Python requirements:
+    - member: >=3.11
+    - workspace:docs: >=3.12, <3.13
+    - workspace:lint: >=3.13
+    ");
+    Ok(())
+}
+
 /// Ensure that group requires-python solves an actual problem
 #[test]
 #[cfg(not(windows))]
@@ -1998,21 +2117,20 @@ fn sync_frozen_member_default_groups_python_sources() -> Result<()> {
         [manifest]
         members = ["member", "root"]
 
-        [manifest.default-groups]
-        member = ["docs"]
-
-        [manifest.group-metadata]
-        member = { docs = { requires-python = ">=3.14" }, test = { requires-python = ">=3.13" }, unbounded = {} }
-
         [[package]]
         name = "member"
         version = "1.0.0"
         source = { virtual = "member" }
+        default-groups = ["docs"]
 
         [package.dev-dependencies]
         docs = []
         test = []
         unbounded = []
+
+        [package.group-requires-python]
+        docs = ">=3.14"
+        test = ">=3.13"
 
         [[package]]
         name = "root"
@@ -9754,6 +9872,124 @@ fn sync_scripts_workspace_member_not_packaged_not_synced() -> Result<()> {
     exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
+    Checked in [TIME]
+    ");
+
+    Ok(())
+}
+
+#[test]
+fn sync_scripts_required_workspace_member() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "root"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["member"]
+
+        [tool.uv.workspace]
+        members = ["member"]
+
+        [tool.uv.sources]
+        member = { workspace = true }
+    "#})?;
+
+    let member = context.temp_dir.child("member");
+    member.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "member"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = []
+
+        [project.scripts]
+        member-entry = "member:main"
+    "#})?;
+    member.child("member.py").write_str(indoc! {r#"
+        def main():
+            print("Hello from member")
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.sync().current_dir(&member), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + member==0.1.0 (from file://[TEMP_DIR]/member)
+    ");
+
+    uv_snapshot!(context.filters(), context.sync().arg("--all-packages"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Checked 1 package in [TIME]
+    ");
+
+    uv_snapshot!(context.filters(), context.sync().arg("--package").arg("member"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Checked 1 package in [TIME]
+    ");
+
+    uv_snapshot!(context.filters(), context.run().arg("--no-sync").arg("member-entry"), @"
+    exit_code: 0 (success)
+    ----- stdout -----
+    Hello from member
+    ");
+
+    Ok(())
+}
+
+#[test]
+fn sync_scripts_required_workspace_member_not_packaged() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "root"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["member"]
+
+        [tool.uv.workspace]
+        members = ["member"]
+
+        [tool.uv.sources]
+        member = { workspace = true }
+    "#})?;
+
+    context
+        .temp_dir
+        .child("member/pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "member"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = []
+
+        [project.scripts]
+        member-entry = "member:main"
+
+        [tool.uv]
+        package = false
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.sync().arg("--all-packages"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    warning: Skipping installation of entry points (`project.scripts`) for package `member` because this project is not packaged; to install entry points, set `tool.uv.package = true` or define a `build-system`
     Checked in [TIME]
     ");
 
