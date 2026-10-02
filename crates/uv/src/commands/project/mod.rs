@@ -37,9 +37,9 @@ use uv_pypi_types::{ConflictItem, ConflictKind, ConflictSet, Conflicts};
 use uv_python::managed::{ManagedPythonInstallation, PythonMinorVersionLink};
 use uv_python::{
     BrokenLink, ConfigDiscovery, EnvironmentPreference, Interpreter, InvalidEnvironmentKind,
-    LenientImplementationName, PythonDownloads, PythonEnvironment, PythonInstallation,
-    PythonPreference, PythonRequest, PythonSource, PythonVariant, PythonVersionFile,
-    VersionFileDiscoveryOptions, VersionRequest,
+    LenientImplementationName, PythonArchitecture, PythonDownloads, PythonEnvironment,
+    PythonInstallation, PythonPreference, PythonRequest, PythonSource, PythonVariant,
+    PythonVersionFile, VersionFileDiscoveryOptions, VersionRequest,
 };
 use uv_requirements::{NamedRequirementsResolver, RequirementsSpecification};
 use uv_resolver::{
@@ -986,6 +986,7 @@ impl ScriptInterpreter {
         python_request: Option<PythonRequest>,
         client_builder: &BaseClientBuilder<'_>,
         python_preference: PythonPreference,
+        python_arch: Option<PythonArchitecture>,
         python_downloads: PythonDownloads,
         install_mirrors: &PythonInstallMirrors,
         keep_incompatible: bool,
@@ -1009,6 +1010,7 @@ impl ScriptInterpreter {
                 EnvironmentKind::Script,
                 python_request.as_ref(),
                 python_preference,
+                python_arch,
                 requires_python
                     .as_ref()
                     .map(|(requires_python, _)| requires_python),
@@ -1034,6 +1036,7 @@ impl ScriptInterpreter {
             python_request.as_ref(),
             EnvironmentPreference::Any,
             python_preference,
+            python_arch,
             python_downloads,
             client_builder,
             cache,
@@ -1143,6 +1146,7 @@ fn check_environment_compatibility(
     kind: EnvironmentKind,
     python_request: Option<&PythonRequest>,
     python_preference: PythonPreference,
+    python_arch: Option<PythonArchitecture>,
     requires_python: Option<&RequiresPython>,
     cache: &Cache,
 ) -> Result<(), EnvironmentIncompatibilityError> {
@@ -1154,13 +1158,16 @@ fn check_environment_compatibility(
         ));
     }
 
+    let python_request = python_request
+        .or_else(|| python_arch.map(|_| &PythonRequest::Any))
+        .map(|request| request.with_default_arch(python_arch.map(PythonArchitecture::into_inner)));
     if let Some(request) = python_request {
         if request.satisfied(environment.interpreter(), cache) {
             debug!("The {kind} environment's Python version satisfies the request: `{request}`");
         } else {
             return Err(EnvironmentIncompatibilityError::PythonRequest(
                 kind,
-                request.clone(),
+                request.into_owned(),
             ));
         }
     }
@@ -1260,7 +1267,7 @@ fn existing_project_environment(
             if unix {
                 let target_path = fs_err::read_link(&path)?;
                 warn_user!(
-                    "Ignoring existing virtual environment linked to non-existent Python interpreter: {} -> {}",
+                    "Ignoring existing virtual environment linked to non-existent Python interpreter: `{}` -> `{}`",
                     path.user_display().cyan(),
                     target_path.user_display().cyan(),
                 );
@@ -1283,6 +1290,7 @@ fn discover_project_environment(
     root: &Path,
     python_request: Option<&PythonRequest>,
     python_preference: PythonPreference,
+    python_arch: Option<PythonArchitecture>,
     requires_python: Option<&RequiresPython>,
     policy: ProjectEnvironmentPolicy,
     centralized: bool,
@@ -1297,6 +1305,7 @@ fn discover_project_environment(
         EnvironmentKind::Project,
         python_request,
         python_preference,
+        python_arch,
         requires_python,
         cache,
     );
@@ -1312,7 +1321,7 @@ fn discover_project_environment(
         && environment.interpreter().python_version() != base_interpreter.python_version()
     {
         debug!(
-            "Clearing cached interpreter info for {} after finding conflicting Python versions ({} and {})",
+            "Clearing cached interpreter info for `{}` after finding conflicting Python versions ({} and {})",
             base_executable.user_display(),
             base_interpreter.python_version(),
             environment.interpreter().python_version(),
@@ -1589,6 +1598,7 @@ impl ProjectInterpreter {
         workspace_python: WorkspacePython,
         client_builder: &BaseClientBuilder<'_>,
         python_preference: PythonPreference,
+        python_arch: Option<PythonArchitecture>,
         python_downloads: PythonDownloads,
         install_mirrors: &PythonInstallMirrors,
         policy: ProjectEnvironmentPolicy,
@@ -1632,6 +1642,7 @@ impl ProjectInterpreter {
                     &root,
                     python_request.as_ref(),
                     python_preference,
+                    python_arch,
                     requires_python,
                     policy,
                     centralized,
@@ -1653,6 +1664,7 @@ impl ProjectInterpreter {
                     &project_environment_path,
                     python_request.as_ref(),
                     python_preference,
+                    python_arch,
                     requires_python,
                     policy,
                     centralized,
@@ -1670,6 +1682,7 @@ impl ProjectInterpreter {
             python_request.as_ref(),
             EnvironmentPreference::OnlySystem,
             python_preference,
+            python_arch,
             python_downloads,
             client_builder,
             cache,
@@ -1687,6 +1700,7 @@ impl ProjectInterpreter {
                 &root,
                 python_request.as_ref(),
                 python_preference,
+                python_arch,
                 requires_python,
                 policy,
                 centralized,
@@ -2077,6 +2091,7 @@ impl ProjectEnvironment {
         install_mirrors: &PythonInstallMirrors,
         client_builder: &BaseClientBuilder<'_>,
         python_preference: PythonPreference,
+        python_arch: Option<PythonArchitecture>,
         python_downloads: PythonDownloads,
         no_sync: bool,
         config_discovery: ConfigDiscovery,
@@ -2121,6 +2136,7 @@ impl ProjectEnvironment {
             workspace_python,
             client_builder,
             python_preference,
+            python_arch,
             python_downloads,
             install_mirrors,
             if no_sync {
@@ -2371,6 +2387,7 @@ impl ScriptEnvironment {
         python_request: Option<PythonRequest>,
         client_builder: &BaseClientBuilder<'_>,
         python_preference: PythonPreference,
+        python_arch: Option<PythonArchitecture>,
         python_downloads: PythonDownloads,
         install_mirrors: &PythonInstallMirrors,
         no_sync: bool,
@@ -2397,6 +2414,7 @@ impl ScriptEnvironment {
             python_request,
             client_builder,
             python_preference,
+            python_arch,
             python_downloads,
             install_mirrors,
             no_sync,
@@ -3416,6 +3434,7 @@ pub(crate) async fn init_script_python_requirement(
     directory: &Path,
     no_pin_python: bool,
     python_preference: PythonPreference,
+    python_arch: Option<PythonArchitecture>,
     python_downloads: PythonDownloads,
     config_discovery: ConfigDiscovery,
     client_builder: &BaseClientBuilder<'_>,
@@ -3445,6 +3464,7 @@ pub(crate) async fn init_script_python_requirement(
         python_request.as_ref(),
         EnvironmentPreference::Any,
         python_preference,
+        python_arch,
         python_downloads,
         client_builder,
         cache,
@@ -3732,7 +3752,7 @@ fn warn_on_requirements_txt_setting(spec: &RequirementsSpecification, settings: 
         if let Some(index_url) = index_url {
             if settings.index_locations.default_index().map(Index::url) != Some(index_url) {
                 warn_user_once!(
-                    "Ignoring `--index-url` from requirements file: `{index_url}`. Instead, use the `--index-url` command-line argument, or set `index-url` in a `uv.toml` or `pyproject.toml` file."
+                    "Ignoring `--index-url` value `{index_url}` from requirements file. Instead, use the `--index-url` command-line argument, or set `index-url` in a `uv.toml` or `pyproject.toml` file."
                 );
             }
         }
@@ -3743,7 +3763,7 @@ fn warn_on_requirements_txt_setting(spec: &RequirementsSpecification, settings: 
                 .any(|index| index.url() == extra_index_url)
             {
                 warn_user_once!(
-                    "Ignoring `--extra-index-url` from requirements file: `{extra_index_url}`. Instead, use the `--extra-index-url` command-line argument, or set `extra-index-url` in a `uv.toml` or `pyproject.toml` file.`"
+                    "Ignoring `--extra-index-url` value `{extra_index_url}` from requirements file. Instead, use the `--extra-index-url` command-line argument, or set `extra-index-url` in a `uv.toml` or `pyproject.toml` file."
                 );
             }
         }
@@ -3754,7 +3774,7 @@ fn warn_on_requirements_txt_setting(spec: &RequirementsSpecification, settings: 
                 .any(|index| index.url() == find_link)
             {
                 warn_user_once!(
-                    "Ignoring `--find-links` from requirements file: `{find_link}`. Instead, use the `--find-links` command-line argument, or set `find-links` in a `uv.toml` or `pyproject.toml` file.`"
+                    "Ignoring `--find-links` value `{find_link}` from requirements file. Instead, use the `--find-links` command-line argument, or set `find-links` in a `uv.toml` or `pyproject.toml` file."
                 );
             }
         }

@@ -1,6 +1,6 @@
 [package]
 name = "uv-bench"
-version = "0.0.88"
+version = "0.0.89"
 description = "This is an internal component crate of uv"
 publish = false
 authors = { workspace = true }
@@ -36,6 +36,11 @@ harness = false
 [[bench]]
 name = "uv_pypi_types"
 path = "benches/uv_pypi_types.rs"
+harness = false
+
+[[bench]]
+name = "uv_python"
+path = "benches/uv_python.rs"
 harness = false
 
 [dev-dependencies]
