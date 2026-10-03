@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -62,7 +62,7 @@ use uv_workspace::{
 use crate::commands::locked_requirements::{LockedRequirements, read_lock_requirements};
 use crate::commands::pip::loggers::{InstallLogger, ResolveLogger};
 use crate::commands::pip::operations::{Changelog, Modifications};
-use crate::commands::project::install_target::InstallTarget;
+use crate::commands::project::install_target::{InstallTarget, PackageSelection};
 use crate::commands::reporters::{PythonDownloadReporter, ResolverReporter};
 use crate::commands::{capitalize, conjunction, pip};
 use crate::printer::Printer;
@@ -73,6 +73,7 @@ use crate::settings::{
 pub(crate) mod add;
 pub(crate) mod audit;
 pub(crate) mod check;
+pub(super) mod discovery;
 mod edit;
 pub(crate) mod environment;
 pub(crate) mod export;
@@ -81,6 +82,7 @@ pub(crate) mod init;
 pub(crate) mod install_target;
 pub(crate) mod lock;
 pub(crate) mod lock_target;
+pub(super) mod lockfile;
 pub(crate) mod remove;
 pub(crate) mod run;
 pub(crate) mod sync;
@@ -1424,15 +1426,16 @@ pub(crate) fn is_centralized_environment_reference(path: &Path, cache: &Cache) -
             .is_ok_and(|target| is_centralized_environment_path(&target, cache))
 }
 
-/// Return the centralized environment path for a given workspace and interpreter.
+/// Return the centralized environment path for a project and interpreter.
 pub(crate) fn centralized_environment_root(
-    workspace: &Workspace,
+    target: ProjectEnvironmentTarget<'_>,
     interpreter: &Interpreter,
     upgradeable: bool,
     cache: &Cache,
 ) -> PathBuf {
-    let workspace_path = fs_err::canonicalize(workspace.install_path())
-        .unwrap_or_else(|_| workspace.install_path().clone());
+    let install_path = target.install_path();
+    let workspace_path =
+        fs_err::canonicalize(install_path).unwrap_or_else(|_| install_path.to_path_buf());
     let interpreter_key = interpreter.key();
     // Use the workspace path to isolate projects and the interpreter key to maximize intra-project
     // environment re-use while avoiding clashes with incompatible environments. Ignoring the patch
@@ -1452,11 +1455,9 @@ pub(crate) fn centralized_environment_root(
             interpreter.python_version().clone(),
         )
     };
-    let name = workspace
-        .pyproject_toml()
-        .project
-        .as_ref()
-        .and_then(|project| cache_name(project.name.as_ref(), Some(100)))
+    let name = target
+        .project_name()
+        .and_then(|name| cache_name(name.as_ref(), Some(100)))
         .or_else(|| {
             workspace_path
                 .file_name()
@@ -1489,14 +1490,14 @@ pub(crate) enum LinkErrorReporting {
     Log,
 }
 
-/// Point the workspace's `.venv` to the centralized environment, returning whether the link was
+/// Point the project's `.venv` to the centralized environment, returning whether the link was
 /// successfully updated.
 pub(crate) fn update_project_environment_link(
     environment: &PythonEnvironment,
-    workspace: &Workspace,
+    target: ProjectEnvironmentTarget<'_>,
     link_error_reporting: LinkErrorReporting,
 ) -> bool {
-    let link = workspace.install_path().join(".venv");
+    let link = target.install_path().join(".venv");
     let report_error = |message: std::fmt::Arguments<'_>| match link_error_reporting {
         LinkErrorReporting::User => warn_user_once!("{message}"),
         LinkErrorReporting::Log => warn!("{message}"),
@@ -1553,6 +1554,46 @@ pub(crate) fn update_project_environment_link(
     false
 }
 
+/// The project information needed to discover and create an environment.
+#[derive(Clone, Copy)]
+pub(crate) enum ProjectEnvironmentTarget<'a> {
+    Workspace(&'a Workspace),
+    Lockfile { root: &'a Path, lock: &'a Lock },
+}
+
+impl<'a> From<&'a Workspace> for ProjectEnvironmentTarget<'a> {
+    fn from(workspace: &'a Workspace) -> Self {
+        Self::Workspace(workspace)
+    }
+}
+
+impl<'a> ProjectEnvironmentTarget<'a> {
+    fn install_path(self) -> &'a Path {
+        match self {
+            Self::Workspace(workspace) => workspace.install_path(),
+            Self::Lockfile { root, .. } => root,
+        }
+    }
+
+    fn project_name(self) -> Option<&'a PackageName> {
+        match self {
+            Self::Workspace(workspace) => workspace
+                .pyproject_toml()
+                .project
+                .as_ref()
+                .map(|project| &project.name),
+            Self::Lockfile { lock, .. } => lock.root().map(uv_lock::Package::name),
+        }
+    }
+
+    fn workspace(self) -> Option<&'a Workspace> {
+        match self {
+            Self::Workspace(workspace) => Some(workspace),
+            Self::Lockfile { .. } => None,
+        }
+    }
+}
+
 /// An interpreter suitable for the project.
 #[derive(Debug)]
 #[expect(clippy::large_enum_variant)]
@@ -1591,9 +1632,9 @@ impl ProjectInterpreter {
         )
     }
 
-    /// Discover the interpreter to use in the current [`Workspace`].
+    /// Discover an interpreter for a workspace or frozen lockfile.
     pub(crate) async fn discover(
-        workspace: &Workspace,
+        target: ProjectEnvironmentTarget<'_>,
         groups: &DependencyGroupsWithDefaults,
         workspace_python: WorkspacePython,
         client_builder: &BaseClientBuilder<'_>,
@@ -1615,7 +1656,8 @@ impl ProjectInterpreter {
             .as_ref()
             .map(|requirement| &requirement.requires_python);
 
-        let environment_selection = workspace.environment_selection(active);
+        let environment_selection =
+            ProjectEnvironmentSelection::from_install_path(target.install_path(), active);
         let centralized = centralized_environments_enabled(&environment_selection, cache);
         let upgradeable = python_request
             .as_ref()
@@ -1624,7 +1666,7 @@ impl ProjectInterpreter {
         // Prefer `.venv`'s interpreter to keep its compatible cached environment selected; derive
         // the cache root instead of trusting the link target.
         if centralized {
-            let project_environment_path = workspace.install_path().join(".venv");
+            let project_environment_path = target.install_path().join(".venv");
             if let Ok(candidate) = PythonEnvironment::from_root(
                 read_environment_path_file(&project_environment_path)
                     .ok()
@@ -1633,7 +1675,7 @@ impl ProjectInterpreter {
                 cache,
             ) {
                 let root = centralized_environment_root(
-                    workspace,
+                    target,
                     candidate.interpreter(),
                     upgradeable,
                     cache,
@@ -1654,7 +1696,7 @@ impl ProjectInterpreter {
         } else {
             let project_environment_path = environment_selection
                 .explicit_path()
-                .map_or_else(|| workspace.install_path().join(".venv"), Path::to_path_buf);
+                .map_or_else(|| target.install_path().join(".venv"), Path::to_path_buf);
             // TODO(tk): Revisit after PEP 832.
             // A centralized path file is not a local environment; let initialization replace it.
             if !(environment_selection.is_default()
@@ -1695,7 +1737,7 @@ impl ProjectInterpreter {
 
         if centralized {
             let root =
-                centralized_environment_root(workspace, python.interpreter(), upgradeable, cache);
+                centralized_environment_root(target, python.interpreter(), upgradeable, cache);
             if let Some(environment) = discover_project_environment(
                 &root,
                 python_request.as_ref(),
@@ -1736,7 +1778,7 @@ impl ProjectInterpreter {
         if let Some(requirement) = requirement.as_ref() {
             let requirement_source = match &requirement.source {
                 WorkspacePythonRequirementSource::Workspace => {
-                    PythonRequirementSource::Workspace(Some(workspace), groups)
+                    PythonRequirementSource::Workspace(target.workspace(), groups)
                 }
                 WorkspacePythonRequirementSource::Lockfile { locked, groups } => {
                     PythonRequirementSource::Lockfile { locked, groups }
@@ -1764,15 +1806,13 @@ impl ProjectInterpreter {
 
 /// Grab a file lock for the project environment to prevent concurrent writes across processes.
 pub(crate) async fn lock_project_environment(
-    workspace: &Workspace,
+    target: ProjectEnvironmentTarget<'_>,
 ) -> Result<LockedFile, LockedFileError> {
+    let install_path = target.install_path();
     LockedFile::acquire(
-        std::env::temp_dir().join(format!(
-            "uv-{}.lock",
-            cache_digest(workspace.install_path())
-        )),
+        std::env::temp_dir().join(format!("uv-{}.lock", cache_digest(&install_path))),
         LockedFileMode::Exclusive,
-        workspace.install_path().simplified_display(),
+        install_path.simplified_display(),
     )
     .await
 }
@@ -1843,16 +1883,16 @@ impl WorkspacePython {
     /// Determine the Python request and requirement from a frozen lockfile.
     async fn from_lockfile(
         python_request: Option<PythonRequest>,
-        workspace: &Workspace,
         target: InstallTarget<'_>,
         groups: &DependencyGroupsWithDefaults,
+        project_dir: &Path,
         config_discovery: ConfigDiscovery,
     ) -> Result<Self, ProjectError> {
         Self::from_requirements(
             python_request,
-            Some(workspace.install_path()),
+            Some(target.install_path()),
             Some(find_lockfile_requires_python(target, groups)?),
-            workspace.install_path(),
+            project_dir,
             config_discovery,
         )
         .await
@@ -2084,7 +2124,7 @@ pub(crate) enum ProjectEnvironment {
 impl ProjectEnvironment {
     /// Initialize a virtual environment for the current project.
     pub(crate) async fn get_or_init(
-        workspace: &Workspace,
+        target: ProjectEnvironmentTarget<'_>,
         frozen_target: Option<InstallTarget<'_>>,
         groups: &DependencyGroupsWithDefaults,
         python: Option<PythonRequest>,
@@ -2101,26 +2141,44 @@ impl ProjectEnvironment {
         link_error_reporting: LinkErrorReporting,
         printer: Printer,
     ) -> Result<Self, ProjectError> {
-        let environment_selection = workspace.environment_selection(active);
+        let environment_selection =
+            ProjectEnvironmentSelection::from_install_path(target.install_path(), active);
         let centralized = centralized_environments_enabled(&environment_selection, cache);
 
         // Lock the project environment to avoid synchronization issues.
-        let _lock = lock_project_environment(workspace)
+        let _lock = lock_project_environment(target)
             .await
             .inspect_err(|err| {
                 warn!("Failed to acquire project environment lock: {err}");
             })
             .ok();
 
-        let workspace_python = if let Some(target) = frozen_target {
-            WorkspacePython::from_lockfile(python, workspace, target, groups, config_discovery)
-                .await?
+        // A selected installation target narrows group requirements. Otherwise a lockfile-only
+        // environment uses the requirements of the entire workspace.
+        let frozen_target = frozen_target.or_else(|| match target {
+            ProjectEnvironmentTarget::Workspace(_) => None,
+            ProjectEnvironmentTarget::Lockfile { root, lock } => Some(InstallTarget::Lockfile {
+                root,
+                project_name: lock.root().map(uv_lock::Package::name),
+                selection: PackageSelection::Workspace,
+                lock,
+            }),
+        });
+        let workspace_python = if let Some(frozen_target) = frozen_target {
+            WorkspacePython::from_lockfile(
+                python,
+                frozen_target,
+                groups,
+                target.install_path(),
+                config_discovery,
+            )
+            .await?
         } else {
             WorkspacePython::from_request(
                 python,
-                Some(workspace),
+                target.workspace(),
                 groups,
-                workspace.install_path(),
+                target.install_path(),
                 config_discovery,
             )
             .await?
@@ -2131,7 +2189,7 @@ impl ProjectEnvironment {
             .is_none_or(|request| !request.includes_patch());
 
         match ProjectInterpreter::discover(
-            workspace,
+            target,
             groups,
             workspace_python,
             client_builder,
@@ -2153,7 +2211,7 @@ impl ProjectEnvironment {
             // If we found an existing, compatible environment, use it.
             ProjectInterpreter::Environment(environment) => {
                 if centralized && !dry_run.enabled() {
-                    update_project_environment_link(&environment, workspace, link_error_reporting);
+                    update_project_environment_link(&environment, target, link_error_reporting);
                 }
                 Ok(Self::Existing(environment))
             }
@@ -2161,11 +2219,11 @@ impl ProjectEnvironment {
             // Otherwise, create a virtual environment with the discovered interpreter.
             ProjectInterpreter::Interpreter(interpreter) => {
                 let root = if centralized {
-                    centralized_environment_root(workspace, &interpreter, upgradeable, cache)
+                    centralized_environment_root(target, &interpreter, upgradeable, cache)
                 } else {
                     environment_selection
                         .explicit_path()
-                        .map_or_else(|| workspace.install_path().join(".venv"), Path::to_path_buf)
+                        .map_or_else(|| target.install_path().join(".venv"), Path::to_path_buf)
                 };
                 let centralized_environment_reference =
                     !centralized && is_centralized_environment_reference(&root, cache);
@@ -2212,13 +2270,11 @@ impl ProjectEnvironment {
                 // 1) The name of the project
                 // 2) The name of the directory at the root of the workspace
                 // 3) No prompt
-                let prompt = workspace
-                    .pyproject_toml()
-                    .project
-                    .as_ref()
-                    .map(|p| p.name.to_string())
+                let prompt = target
+                    .project_name()
+                    .map(ToString::to_string)
                     .or_else(|| {
-                        workspace
+                        target
                             .install_path()
                             .file_name()
                             .map(|f| f.to_string_lossy().to_string())
@@ -2304,7 +2360,7 @@ impl ProjectEnvironment {
                 )?;
 
                 if centralized {
-                    update_project_environment_link(&environment, workspace, link_error_reporting);
+                    update_project_environment_link(&environment, target, link_error_reporting);
                 }
 
                 if replace_environment {
@@ -2966,7 +3022,7 @@ pub(crate) async fn resolve_environment(
         excludes,
         source_trees,
         project,
-        BTreeSet::default(),
+        BTreeMap::default(),
         &extras,
         &groups,
         preferences,
@@ -3364,7 +3420,7 @@ pub(crate) async fn update_environment(
         excludes,
         source_trees,
         project,
-        BTreeSet::default(),
+        BTreeMap::default(),
         &extras,
         &groups,
         preferences,
