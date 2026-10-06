@@ -11,7 +11,7 @@ use crate::commands::project::lock::{LockMode, LockOperation};
 use crate::commands::project::lock_target::LockTarget;
 use crate::commands::project::{
     ProjectEnvironmentPolicy, ProjectEnvironmentTarget, ProjectInterpreter, ProjectPythonRequest,
-    ScriptInterpreter, UniversalState,
+    ScriptInterpreter,
 };
 use crate::commands::reporters::AuditReporter;
 use crate::printer::Printer;
@@ -29,9 +29,10 @@ use uv_cli::AuditOutputFormat;
 use uv_client::{BaseClientBuilder, CachedClient, RegistryClientBuilder};
 use uv_configuration::{
     ActiveEnvironment, Concurrency, DependencyGroups, DependencyGroupsWithDefaults,
-    ExtrasSpecification, ExtrasSpecificationWithDefaults, TargetTriple,
+    ExtrasSpecification, ExtrasSpecificationWithDefaults, KeyringProviderType, TargetTriple,
 };
-use uv_distribution_types::{IndexCapabilities, IndexUrl};
+use uv_dispatch::UniversalState;
+use uv_distribution_types::{IndexCapabilities, IndexLocations, IndexUrl};
 use uv_fs::{CWD, find_git_repository_root, relative_to};
 use uv_lock::Lock;
 use uv_normalize::{DefaultExtras, DefaultGroups};
@@ -226,7 +227,8 @@ pub(crate) async fn audit(
         target.install_path(),
         &extras,
         &groups,
-        &settings,
+        &settings.index_locations,
+        settings.keyring_provider,
         client_builder,
         concurrency,
         &cache,
@@ -280,7 +282,8 @@ pub(crate) async fn audit_lock(
     root: &Path,
     extras: &ExtrasSpecificationWithDefaults,
     groups: &DependencyGroupsWithDefaults,
-    settings: &ResolverSettings,
+    index_locations: &IndexLocations,
+    keyring_provider: KeyringProviderType,
     client_builder: BaseClientBuilder<'_>,
     concurrency: Concurrency,
     cache: &Cache,
@@ -294,8 +297,7 @@ pub(crate) async fn audit_lock(
     let mut projects = auditable.projects(root)?;
 
     // Flat indexes cannot provide PEP 792 project-status metadata.
-    let flat_index_urls: FxHashSet<&IndexUrl> = settings
-        .index_locations
+    let flat_index_urls: FxHashSet<&IndexUrl> = index_locations
         .flat_indexes()
         .map(|index| &index.url)
         .collect();
@@ -308,8 +310,8 @@ pub(crate) async fn audit_lock(
         .collect();
     let base_client = client_builder.clone().build()?;
     let registry_client = RegistryClientBuilder::new(client_builder, cache.clone())
-        .index_locations(settings.index_locations.clone())
-        .keyring(settings.keyring_provider)
+        .index_locations(index_locations.clone())
+        .keyring(keyring_provider)
         .build()?;
     let capabilities = IndexCapabilities::default();
     let status_audit =

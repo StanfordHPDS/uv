@@ -15,7 +15,7 @@ use uv_configuration::{
     ActiveEnvironment, Concurrency, Constraints, DependencyGroupsWithDefaults, DryRun,
     ExcludeDependency, ExtrasSpecification, Override, PackageOverride, Reinstall, Upgrade,
 };
-use uv_dispatch::BuildDispatch;
+use uv_dispatch::{BuildDispatch, UniversalState};
 use uv_distribution::{DistributionDatabase, FirstPartyPackages, LoweredExtraBuildDependencies};
 use uv_distribution_types::{
     DependencyMetadata, HashCollection, IndexLocations, NameRequirementSpecification, Requirement,
@@ -32,16 +32,14 @@ use uv_python::{
     ConfigDiscovery, Interpreter, PythonArchitecture, PythonDownloads, PythonEnvironment,
     PythonPreference, PythonRequest,
 };
-use uv_requirements::ExtrasResolver;
+use uv_requirements::{ExtrasResolver, script_extra_build_requires};
 use uv_resolver::{
     FlatIndex, InMemoryIndex, Options, OptionsBuilder, PythonRequirement, ResolverEnvironment,
     UniversalMarker,
 };
 use uv_scripts::Pep723Script;
 use uv_settings::PythonInstallMirrors;
-use uv_types::{
-    BuildContext, BuildIsolation, EmptyInstalledPackages, HashStrategy, SourceTreeEditablePolicy,
-};
+use uv_types::{BuildIsolation, HashStrategy, SourceTreeEditablePolicy};
 use uv_warnings::{warn_user, warn_user_once, warn_user_with_chain};
 use uv_workspace::{
     DiscoveryOptions, Editability, VirtualProject, WorkspaceCache, WorkspaceMember,
@@ -52,8 +50,7 @@ use crate::commands::pip::loggers::{DefaultResolveLogger, ResolveLogger, Summary
 use crate::commands::project::lock_target::{LockTarget, find_lock_format_error};
 use crate::commands::project::{
     MissingLockfileSource, ProjectEnvironmentPolicy, ProjectEnvironmentTarget, ProjectError,
-    ProjectInterpreter, ProjectPythonRequest, ScriptInterpreter, UniversalState,
-    init_script_python_requirement, script_extra_build_requires,
+    ProjectInterpreter, ProjectPythonRequest, ScriptInterpreter, init_script_python_requirement,
 };
 use crate::commands::reporters::{PythonDownloadReporter, ResolverReporter};
 use crate::commands::{ExitStatus, ScriptPath, UvError, pip};
@@ -942,7 +939,8 @@ async fn do_lock(
             // Try to get extra build dependencies from the script metadata
             script_extra_build_requires(
                 (*script).into(),
-                settings,
+                sources,
+                index_locations,
                 cache,
                 workspace_cache,
                 client.credentials_cache(),
@@ -1163,7 +1161,7 @@ async fn do_lock(
                 &extras,
                 &groups,
                 preferences,
-                EmptyInstalledPackages,
+                None,
                 &hasher,
                 &Reinstall::default(),
                 upgrade,
@@ -1268,7 +1266,7 @@ pub(crate) enum ValidatedLock {
 
 impl ValidatedLock {
     /// Validate a [`Lock`] against the workspace requirements.
-    pub(crate) async fn validate<Context: BuildContext>(
+    pub(crate) async fn validate(
         lock: Lock,
         install_path: &Path,
         packages: &BTreeMap<PackageName, WorkspaceMember>,
@@ -1294,7 +1292,7 @@ impl ValidatedLock {
         options: &Options,
         hasher: &HashStrategy,
         index: &InMemoryIndex,
-        database: &DistributionDatabase<'_, Context>,
+        database: &DistributionDatabase<'_, BuildDispatch<'_>>,
         preview: Preview,
         printer: Printer,
     ) -> Result<Self, ProjectError> {

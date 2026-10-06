@@ -11,6 +11,7 @@ use uv_configuration::{
     ActiveEnvironment, Concurrency, DependencyGroups, DependencyGroupsWithDefaults, DryRun,
     ExtrasSpecification, InstallOptions,
 };
+use uv_dispatch::UniversalState;
 use uv_fs::normalize_path;
 use uv_normalize::{DEV_DEPENDENCIES, DefaultExtras, PackageName};
 use uv_preview::{Preview, PreviewFeature};
@@ -26,12 +27,13 @@ use uv_workspace::{DiscoveryOptions, VirtualProject, WorkspaceCache, WorkspaceEr
 use crate::commands::pip::loggers::{SummaryInstallLogger, SummaryResolveLogger};
 use crate::commands::pip::operations::Modifications;
 use crate::commands::project::environment::CachedEnvironment;
-use crate::commands::project::install_target::InstallTarget;
+use crate::commands::project::install_target::{InstallTarget, PackageSelection};
 use crate::commands::project::lock::LockMode;
 use crate::commands::project::lock_target::LockTarget;
+use crate::commands::project::sync::MalwareCheckContext;
 use crate::commands::project::{
     LinkErrorReporting, ProjectEnvironment, ProjectEnvironmentPolicy, ProjectEnvironmentTarget,
-    ProjectInterpreter, ProjectPythonRequest, ScriptEnvironment, ScriptInterpreter, UniversalState,
+    ProjectInterpreter, ProjectPythonRequest, ScriptEnvironment, ScriptInterpreter,
 };
 use crate::commands::reporters::PythonDownloadReporter;
 use crate::commands::{ExitStatus, UvError, project};
@@ -462,7 +464,7 @@ pub(crate) async fn check(
             DryRun::Disabled,
             printer,
             preview,
-            &malware_settings,
+            MalwareCheckContext::from(&malware_settings),
         )
         .await
         {
@@ -479,7 +481,7 @@ pub(crate) async fn check(
         Some(venv)
     } else if let Some(project) = &project {
         let extras = extras.with_defaults(DefaultExtras::default());
-        let mut malware_context = project::sync::MalwareCheckContext::from(&malware_settings);
+        let mut malware_context = MalwareCheckContext::from(&malware_settings);
         let install_options = InstallOptions::new(
             no_install_project,
             false,
@@ -574,6 +576,7 @@ pub(crate) async fn check(
             LockMode::Write(lock_interpreter)
         };
 
+        let selection = PackageSelection::from_args(all_packages, &package, project.project_name());
         let result = match Box::pin(
             project::lock::LockOperation::new(
                 mode,
@@ -587,10 +590,9 @@ pub(crate) async fn check(
                 printer,
                 preview,
             )
-            .with_first_party_exclusions(project::sync::first_party_exclusions(
-                project,
-                all_packages,
-                &package,
+            .with_first_party_exclusions(selection.first_party_exclusions(
+                project.workspace(),
+                project.project_name(),
                 &install_options,
             ))
             .execute(project.workspace().into()),
@@ -601,12 +603,7 @@ pub(crate) async fn check(
             Err(err) => return Err(UvError::from(err).into()),
         };
 
-        let target = project::sync::identify_project_installation_target(
-            project,
-            result.lock(),
-            all_packages,
-            &package,
-        );
+        let target = InstallTarget::from_project(project, result.lock(), selection);
 
         target.validate_extras(&extras)?;
         target.validate_groups(&groups)?;

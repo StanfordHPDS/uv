@@ -1,5 +1,6 @@
 use std::fmt::Write;
 use std::str::FromStr;
+use uv_dispatch::PlatformState;
 use uv_distribution_types::RequirementScope;
 
 use anyhow::{Result, bail};
@@ -42,8 +43,8 @@ use crate::commands::pip::loggers::{
 use crate::commands::pip::operations::{self, Modifications};
 use crate::commands::pip::{resolution_markers, resolution_tags};
 use crate::commands::project::{
-    EnvironmentResolution, EnvironmentSpecification, PlatformState, ProjectError,
-    resolve_environment, resolve_names, sync_environment, update_environment,
+    EnvironmentResolution, EnvironmentSpecification, ProjectError, resolve_environment,
+    resolve_names, sync_environment, update_environment,
 };
 use crate::commands::tool::common::{
     ToolLock, ToolPython, finalize_tool_install, refine_interpreter, remove_entrypoints,
@@ -194,7 +195,7 @@ pub(crate) async fn install(
             let requirement = resolve_names(
                 requirements,
                 &interpreter,
-                &settings,
+                &settings.resolver,
                 &build_constraints,
                 &client_builder,
                 &state,
@@ -387,7 +388,7 @@ pub(crate) async fn install(
             resolve_names(
                 spec.requirements.clone(),
                 &interpreter,
-                &settings,
+                &settings.resolver,
                 &build_constraints,
                 &client_builder,
                 &state,
@@ -444,7 +445,7 @@ pub(crate) async fn install(
     let receipt_overrides = resolve_names(
         spec.overrides,
         &interpreter,
-        &settings,
+        &settings.resolver,
         &build_constraints,
         &client_builder,
         &state,

@@ -10,6 +10,7 @@ use uv_cache::Cache;
 use uv_cache_key::CanonicalUrl;
 use uv_client::BaseClientBuilder;
 use uv_configuration::{Concurrency, Constraints, DryRun, HashCheckingMode, TargetTriple};
+use uv_dispatch::PlatformState;
 use uv_distribution::LoweredExtraBuildDependencies;
 use uv_distribution_types::{ExtraBuildRequires, Index, Name, Requirement, RequirementSource};
 use uv_fs::{CWD, Simplified};
@@ -32,7 +33,7 @@ use crate::commands::pip::loggers::{
 };
 use crate::commands::pip::{operations::Modifications, resolution_tags};
 use crate::commands::project::{
-    EnvironmentResolution, EnvironmentUpdate, PlatformState, resolve_environment, sync_environment,
+    EnvironmentResolution, EnvironmentUpdate, resolve_environment, sync_environment,
     update_environment,
 };
 use crate::commands::reporters::PythonDownloadReporter;
@@ -59,6 +60,7 @@ pub(crate) async fn upgrade(
     workspace_cache: &WorkspaceCache,
     printer: Printer,
     preview: Preview,
+    render_error: fn(&anyhow::Error, Printer) -> std::fmt::Result,
 ) -> Result<ExitStatus> {
     let installed_tools = InstalledTools::from_settings()?.init()?;
     let _lock = installed_tools.lock().await?;
@@ -180,7 +182,7 @@ pub(crate) async fn upgrade(
             .sorted_unstable_by(|(name_a, _), (name_b, _)| name_a.cmp(name_b))
         {
             trace!("Error trace: {err:?}");
-            crate::commands::diagnostics::write_error_chain(
+            render_error(
                 &err.context(format!("Failed to upgrade {}", name.green())),
                 printer,
             )?;

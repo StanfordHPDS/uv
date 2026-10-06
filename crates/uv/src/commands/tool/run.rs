@@ -1,8 +1,10 @@
+use std::ffi::OsString;
 use std::fmt::Display;
 use std::fmt::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
+use uv_dispatch::PlatformState;
 use uv_distribution_types::RequirementScope;
 
 use anyhow::{Context, bail};
@@ -14,7 +16,6 @@ use tracing::{debug, warn};
 
 use uv_cache::{Cache, Refresh};
 use uv_cache_info::Timestamp;
-use uv_cli::ExternalCommand;
 use uv_client::{BaseClientBuilder, RegistryClientBuilder};
 use uv_configuration::{
     Concurrency, Constraints, DependencyMode, DependencyModifiers, Excludes, GitLfsSetting,
@@ -53,9 +54,7 @@ use crate::commands::pip::loggers::{
     DefaultInstallLogger, DefaultResolveLogger, SummaryInstallLogger, SummaryResolveLogger,
 };
 use crate::commands::pip::operations;
-use crate::commands::project::{
-    EnvironmentSpecification, PlatformState, ProjectError, resolve_names,
-};
+use crate::commands::project::{EnvironmentSpecification, ProjectError, resolve_names};
 use crate::commands::reporters::PythonDownloadReporter;
 use crate::commands::tool::common::{ToolPython, matching_packages, refine_interpreter};
 use crate::commands::tool::{Target, ToolRequest};
@@ -146,7 +145,7 @@ fn find_verbose_flag(args: &[std::ffi::OsString]) -> Option<&str> {
 /// Run a command.
 #[expect(clippy::fn_params_excessive_bools)]
 pub(crate) async fn run(
-    command: Option<ExternalCommand>,
+    command: Option<Vec<OsString>>,
     from: Option<String>,
     with: &[RequirementsSource],
     constraints: &[RequirementsSource],
@@ -206,7 +205,7 @@ pub(crate) async fn run(
     let env_file_environment = if no_env_file {
         Vec::new()
     } else {
-        read_env_files(env_file.iter())?
+        read_env_files(env_file.as_slice())?
     };
 
     let Some(command) = command else {
@@ -216,8 +215,7 @@ pub(crate) async fn run(
         return Ok(ExitStatus::Error);
     };
 
-    let (target, args) = command.split();
-    let Some(target) = target else {
+    let Some((target, args)) = command.split_first() else {
         return Err(anyhow::anyhow!("No tool command provided"));
     };
 
@@ -877,7 +875,7 @@ async fn get_or_create_environment(
                     let requirement = resolve_names(
                         vec![spec],
                         &interpreter,
-                        settings,
+                        &settings.resolver,
                         &build_constraints,
                         client_builder,
                         &state,
@@ -1042,7 +1040,7 @@ async fn get_or_create_environment(
             resolve_names(
                 spec.requirements.clone(),
                 &interpreter,
-                settings,
+                &settings.resolver,
                 &build_constraints,
                 client_builder,
                 &state,
@@ -1070,7 +1068,7 @@ async fn get_or_create_environment(
     let overrides = resolve_names(
         spec.overrides.clone(),
         &interpreter,
-        settings,
+        &settings.resolver,
         &build_constraints,
         client_builder,
         &state,
