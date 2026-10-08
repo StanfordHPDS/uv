@@ -3,10 +3,9 @@ use std::fmt::Write;
 use anyhow::Result;
 use owo_colors::OwoColorize;
 
-use crate::commands::ExitStatus;
-use crate::printer::Printer;
-use uv_cli::VersionFormat;
 use uv_cli::version::uv_self_version;
+use uv_command_support::{ExitStatus, Printer};
+use uv_configuration::VersionFormat;
 
 /// Display version information for uv itself (`uv self version`)
 pub(crate) fn self_version(
@@ -25,7 +24,7 @@ pub(crate) fn self_version(
         }
         VersionFormat::Json => {
             let string = serde_json::to_string_pretty(&version_info)?;
-            writeln!(printer.stdout(), "{string}")?;
+            writeln!(printer.stdout_important(), "{string}")?;
         }
     }
 

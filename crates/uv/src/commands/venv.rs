@@ -10,6 +10,7 @@ use tracing::warn;
 
 use uv_cache::Cache;
 use uv_client::{BaseClientBuilder, RegistryClientBuilder};
+use uv_command_support::{ExitStatus, Printer};
 use uv_configuration::{
     ActiveEnvironment, BuildOptions, Concurrency, Constraints, DependencyGroups, DryRun,
     IndexStrategy, KeyringProviderType, NoBinary, NoBuild, NoSources,
@@ -23,9 +24,10 @@ use uv_fs::Simplified;
 use uv_install_wheel::LinkMode;
 use uv_normalize::DefaultGroups;
 use uv_preview::Preview;
-use uv_python::{
-    ConfigDiscovery, EnvironmentPreference, PythonArchitecture, PythonDownloads,
-    PythonInstallation, PythonPreference, PythonRequest,
+use uv_python_discovery::ConfigDiscovery;
+use uv_python_discovery::PythonInstallation;
+use uv_python_types::{
+    EnvironmentPreference, PythonArchitecture, PythonDownloads, PythonPreference, PythonRequest,
 };
 use uv_resolver::{ExcludeNewer, FlatIndex};
 use uv_settings::PythonInstallMirrors;
@@ -37,17 +39,16 @@ use uv_virtualenv::{OnExisting, RemovalReason, Seed};
 use uv_warnings::warn_user;
 use uv_workspace::{DiscoveryOptions, VirtualProject, WorkspaceCache, WorkspaceErrorKind};
 
-use crate::commands::ExitStatus;
-use crate::commands::pip::loggers::{DefaultInstallLogger, InstallLogger};
-use crate::commands::pip::operations::{Changelog, report_interpreter};
-use crate::commands::project::{
-    LinkErrorReporting, ProjectEnvironmentTarget, ProjectPythonRequest,
-    centralized_environment_root, centralized_environments_enabled,
-    is_centralized_environment_reference, lock_project_environment,
-    update_project_environment_link,
+use uv_environment_operations::{
+    LinkErrorReporting, ProjectEnvironmentTarget, centralized_environment_root,
+    centralized_environments_enabled, is_centralized_environment_reference,
+    lock_project_environment, update_project_environment_link,
 };
-use crate::commands::reporters::PythonDownloadReporter;
-use crate::printer::Printer;
+use uv_install_operations::Changelog;
+use uv_install_operations::loggers::{DefaultInstallLogger, InstallLogger};
+use uv_python_discovery::ProjectPythonRequest;
+use uv_python_discovery::PythonDownloadReporter;
+use uv_python_discovery::report_interpreter;
 
 #[derive(Error, Debug)]
 enum VenvError {
@@ -169,8 +170,7 @@ pub(crate) async fn venv(
             client_builder,
             cache,
             Some(&reporter),
-            install_mirrors.python_install_mirror.as_deref(),
-            install_mirrors.pypy_install_mirror.as_deref(),
+            install_mirrors.mirrors(),
             install_mirrors.python_downloads_json_url.as_deref(),
         )
         .await?;
@@ -276,6 +276,7 @@ pub(crate) async fn venv(
         upgradeable,
     )
     .map_err(VenvError::Creation)?;
+    venv.cache_virtualenv(system_site_packages, cache)?;
 
     // Install seed packages.
     if let Seed::Enabled = seed {

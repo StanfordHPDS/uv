@@ -8,7 +8,7 @@ use uv_test::uv_snapshot;
 
 #[tokio::test]
 async fn invalid_cloud_endpoint_urls() {
-    let context = uv_test::test_context!("3.12");
+    let context = uv_test::test_context!("3.12").with_filtered_http_retries();
     let proxy = crate::pypi_proxy::start().await;
     let mut filters = context.filters();
     filters.push((r"UV_(S3|GCS|AZURE)_ENDPOINT_URL", "UV_[CLOUD]_ENDPOINT_URL"));
@@ -1045,6 +1045,18 @@ async fn login_text_store() {
     exit_code: 0 (success)
     ----- stderr -----
     Stored credentials for testuser@http://localhost/
+    ");
+
+    // HTTP should be allowed on IPv6 loopback
+    uv_snapshot!(context.filters(), context.auth_login()
+        .arg("http://[::1]:1324/simple")
+        .arg("--username")
+        .arg("testuser")
+        .arg("--password")
+        .arg("testpass"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Stored credentials for testuser@http://[::1]:1324/
     ");
 }
 

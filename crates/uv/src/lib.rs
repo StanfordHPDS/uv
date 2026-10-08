@@ -16,7 +16,6 @@ use clap::error::{ContextKind, ContextValue};
 use clap::{CommandFactory, Error, Parser};
 use futures::FutureExt;
 use owo_colors::OwoColorize;
-use settings::PipTreeSettings;
 use tokio::task::spawn_blocking;
 use tracing::{debug, instrument, trace};
 
@@ -24,6 +23,13 @@ use tracing::{debug, instrument, trace};
 use crate::install_source::InstallSource;
 use uv_cache::{Cache, Refresh};
 use uv_cache_info::Timestamp;
+use uv_cli::settings;
+use uv_cli::settings::{
+    CacheSettings, GlobalSettings, PipCheckSettings, PipCompileSettings, PipFreezeSettings,
+    PipInstallSettings, PipListSettings, PipShowSettings, PipSyncSettings, PipTreeSettings,
+    PipUninstallSettings, PublishSettings, resolve_color,
+};
+
 #[cfg(feature = "self-update")]
 use uv_cli::SelfUpdateArgs;
 use uv_cli::{
@@ -33,6 +39,8 @@ use uv_cli::{
     TopLevelArgs, WorkspaceCommand, WorkspaceNamespace, compat::CompatArgs, options::ArgumentError,
 };
 use uv_client::BaseClientBuilder;
+use uv_command_support::{ExitStatus, Printer, UvError};
+use uv_configuration::{PythonUpgrade, PythonUpgradeSource, ToolRunCommand};
 use uv_flags::EnvironmentFlags;
 use uv_fs::{CWD, Simplified, normalize_path};
 #[cfg(feature = "self-update")]
@@ -40,7 +48,8 @@ use uv_pep440::release_specifiers_to_ranges;
 use uv_pep508::VersionOrUrl;
 use uv_preview::PreviewFeature;
 use uv_pypi_types::{ParsedDirectoryUrl, ParsedUrl};
-use uv_python::{ConfigDiscovery, PythonRequest};
+use uv_python_discovery::ConfigDiscovery;
+use uv_python_types::PythonRequest;
 use uv_requirements::{GroupsSpecification, RequirementsSource};
 use uv_requirements_txt::RequirementsTxtRequirement;
 use uv_scripts::{Pep723Error, Pep723Item, Pep723Script};
@@ -50,23 +59,12 @@ use uv_threads::{RAYON_PARALLELISM, min_stack_size};
 use uv_warnings::{warn_user, warn_user_once};
 use uv_workspace::{DiscoveryOptions, Workspace, WorkspaceCache};
 
-use crate::commands::{
-    ExitStatus, ParsedRunCommand, ProjectError, RunCommand, ScriptPath, ToolRunCommand, UvError,
-};
-use crate::printer::Printer;
-use crate::settings::{
-    CacheSettings, GlobalSettings, PipCheckSettings, PipCompileSettings, PipFreezeSettings,
-    PipInstallSettings, PipListSettings, PipShowSettings, PipSyncSettings, PipUninstallSettings,
-    PublishSettings, resolve_color,
-};
+use crate::commands::{ParsedRunCommand, RunCommand, ScriptPath};
 
-pub(crate) mod child;
-pub mod commands;
+mod commands;
 #[cfg(not(feature = "self-update"))]
 mod install_source;
 mod logging;
-pub(crate) mod printer;
-pub(crate) mod settings;
 
 /// Construct the shared HTTP client builder from the resolved global settings.
 fn base_client_builder<'a>(globals: &GlobalSettings) -> BaseClientBuilder<'a> {
@@ -542,7 +540,8 @@ pub async fn run(cli: Cli, global_initialization: GlobalInitialization) -> Resul
     }
 
     // Resolve the cache settings.
-    let cache_settings = CacheSettings::resolve(*cli.top_level.cache_args, filesystem.as_ref());
+    let cache_settings =
+        CacheSettings::resolve(*cli.top_level.cache_args, filesystem.as_ref(), &environment);
 
     if global_initialization.needs_initialization() {
         // Set and finalize the global preview configuration.
@@ -1361,6 +1360,7 @@ pub async fn run(cli: Cli, global_initialization: GlobalInitialization) -> Resul
                 &workspace_cache,
                 printer,
                 globals.preview,
+                commands::diagnostics::write_error_chain,
             )
             .await
         }
@@ -1865,9 +1865,7 @@ pub async fn run(cli: Cli, global_initialization: GlobalInitialization) -> Resul
                 args.all_arches,
                 args.show_urls,
                 args.output_format,
-                args.python_downloads_json_url,
-                args.python_install_mirror,
-                args.pypy_install_mirror,
+                args.install_mirrors,
                 globals.python_preference,
                 globals.python_arch,
                 globals.python_downloads,
@@ -1896,9 +1894,7 @@ pub async fn run(cli: Cli, global_initialization: GlobalInitialization) -> Resul
                 args.bin,
                 args.registry,
                 args.force,
-                args.python_install_mirror,
-                args.pypy_install_mirror,
-                args.python_downloads_json_url,
+                args.install_mirrors,
                 client_builder.subcommand(vec!["python".to_owned(), "install".to_owned()]),
                 args.default,
                 globals.python_arch,
@@ -1918,7 +1914,7 @@ pub async fn run(cli: Cli, global_initialization: GlobalInitialization) -> Resul
             // Resolve the settings from the command-line arguments and workspace configuration.
             let args = settings::PythonUpgradeSettings::resolve(args, filesystem, environment)?;
             show_settings!(args);
-            let upgrade = commands::PythonUpgrade::Enabled(commands::PythonUpgradeSource::Upgrade);
+            let upgrade = PythonUpgrade::Enabled(PythonUpgradeSource::Upgrade);
 
             // Initialize the cache.
             let cache = cache.init().await?;
@@ -1932,9 +1928,7 @@ pub async fn run(cli: Cli, global_initialization: GlobalInitialization) -> Resul
                 args.bin,
                 args.registry,
                 args.force,
-                args.python_install_mirror,
-                args.pypy_install_mirror,
-                args.python_downloads_json_url,
+                args.install_mirrors,
                 client_builder.subcommand(vec!["python".to_owned(), "upgrade".to_owned()]),
                 args.default,
                 globals.python_arch,
@@ -3144,14 +3138,6 @@ where
             let error = match err.downcast::<UvError>() {
                 Ok(error) => error,
                 Err(err) if err.is::<ArgumentError>() => UvError::argument(err),
-                Err(err)
-                    if matches!(
-                        err.downcast_ref::<ProjectError>(),
-                        Some(ProjectError::LockFormat(..))
-                    ) =>
-                {
-                    UvError::User(err)
-                }
                 Err(err) => UvError::unexpected(err),
             };
             match error {
