@@ -3059,6 +3059,44 @@ fn allow_insecure_host() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "Configuration tests are not yet supported on Windows"
+)]
+fn allow_insecure_host_invalid_fields() -> anyhow::Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let config = context.temp_dir.child("uv.toml");
+
+    config.write_str(r#"allow-insecure-host = [{ scheme = "https" }]"#)?;
+    uv_snapshot!(context.filters(),
+        add_shared_args(context.version()).arg("--show-settings"), @r#"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Failed to parse: uv.toml
+      cause: TOML parse error at line 1, column 24
+               |
+             1 | allow-insecure-host = [{ scheme = "https" }]
+               |                        ^^^^^^^^^^^^^^^^^^^^
+             missing field `host`
+    "#);
+
+    config.write_str(r#"allow-insecure-host = [{ host = "example.com", port = "bad" }]"#)?;
+    uv_snapshot!(context.filters(),
+        add_shared_args(context.version()).arg("--show-settings"), @r#"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Failed to parse: uv.toml
+      cause: TOML parse error at line 1, column 55
+               |
+             1 | allow-insecure-host = [{ host = "example.com", port = "bad" }]
+               |                                                       ^^^^^
+             invalid type: string "bad", expected u16
+    "#);
+
+    Ok(())
+}
+
 /// Resolve relative CLI indexes and find-links against the directory selected by `--directory`.
 #[test]
 #[cfg_attr(
@@ -3863,20 +3901,7 @@ fn verify_hashes() -> anyhow::Result<()> {
             .arg("-r")
             .arg("requirements.in")
             .arg("--no-require-hashes")
-            .arg("--show-settings"), @"
-    ...
-             link_mode: Clone,
-             compile_bytecode: false,
-             sources: None,
-    -        hash_checking: Some(
-    -            Verify,
-    -        ),
-    +        hash_checking: None,
-             upgrade: Upgrade {
-                 strategy: None,
-                 constraints: {},
-    ...
-    "
+            .arg("--show-settings"), @""
     );
 
     // Compare against output of the same command without `UV_NO_VERIFY_HASHES=1`.
@@ -3912,6 +3937,18 @@ fn verify_hashes() -> anyhow::Result<()> {
             .arg("--show-settings"),
         @""
     );
+
+    // Explicitly configuring the default must also retain verification.
+    context.temp_dir.child("uv.toml").write_str(
+        r"
+        [pip]
+        require-hashes = false
+        ",
+    )?;
+    diff_uv_snapshot!(context.filters(), &default, add_shared_args(context.pip_install())
+        .arg("-r")
+        .arg("requirements.in")
+        .arg("--show-settings"), @"");
 
     Ok(())
 }
