@@ -6,8 +6,11 @@ pub mod find_links;
 mod http_server;
 pub mod package_server;
 pub mod packse;
+mod path;
 pub mod pypi_proxy;
 mod vendor;
+
+pub use path::{assert_link_target, assert_path_missing};
 
 use std::borrow::BorrowMut;
 use std::ffi::OsString;
@@ -46,7 +49,7 @@ static TEST_TIMESTAMP: &str = "2024-03-25T00:00:00Z";
 pub const DEFAULT_PYTHON_VERSION: &str = "3.12";
 
 // The expected latest patch version for each Python minor version.
-const LATEST_PYTHON_3_15: &str = "3.15.0rc3";
+const LATEST_PYTHON_3_15: &str = "3.15.0";
 const LATEST_PYTHON_3_14: &str = "3.14.8";
 const LATEST_PYTHON_3_13: &str = "3.13.16";
 pub const LATEST_PYTHON_3_12: &str = "3.12.15";
@@ -999,14 +1002,25 @@ impl TestContext {
             .expect("CARGO_MANIFEST_DIR should be doubly nested in workspace")
             .to_path_buf();
 
-        let download_list = ManagedPythonDownloadList::new_only_embedded().unwrap();
+        let download_list = if python_versions.is_empty() {
+            None
+        } else {
+            Some(
+                ManagedPythonDownloadList::new_only_embedded()
+                    .expect("Failed to load embedded Python downloads"),
+            )
+        };
 
         let python_versions: Vec<_> = python_versions
             .iter()
             .map(|version| PythonVersion::from_str(version).unwrap())
             .zip(
-                python_installations_for_versions(&temp_dir, python_versions, &download_list)
-                    .expect("Failed to find test Python versions"),
+                python_installations_for_versions(
+                    &temp_dir,
+                    python_versions,
+                    download_list.as_ref(),
+                )
+                .expect("Failed to find test Python versions"),
             )
             .collect();
 
@@ -2050,8 +2064,7 @@ impl TestContext {
     ///
     /// This assumes that a lock has already been performed.
     pub fn diff_lock(&self, change: impl Fn(&Self) -> Command) -> String {
-        let lock_path = ChildPath::new(self.temp_dir.join("uv.lock"));
-        let old_lock = fs_err::read_to_string(&lock_path).unwrap();
+        let old_lock = self.read("uv.lock");
         let (snapshot, output) = run_and_format(
             change(self),
             self.filters(),
@@ -2060,7 +2073,7 @@ impl TestContext {
             None,
         );
         assert!(output.status.success(), "{snapshot}");
-        let new_lock = fs_err::read_to_string(&lock_path).unwrap();
+        let new_lock = self.read("uv.lock");
         diff_snapshot(&old_lock, &new_lock, 10)
     }
 
@@ -2068,6 +2081,15 @@ impl TestContext {
     pub fn read(&self, file: impl AsRef<Path>) -> String {
         fs_err::read_to_string(self.temp_dir.join(&file))
             .unwrap_or_else(|_| panic!("Missing file: `{}`", file.user_display()))
+    }
+
+    /// Read a file as bytes, resolving relative paths against the temporary directory.
+    #[track_caller]
+    pub fn read_bytes(&self, file: impl AsRef<Path>) -> Vec<u8> {
+        match fs_err::read(self.temp_dir.join(&file)) {
+            Ok(contents) => contents,
+            Err(error) => panic!("Failed to read `{}`: {error}", file.user_display()),
+        }
     }
 
     /// Creates a new `Command` that is intended to be suitable for use in
@@ -2252,9 +2274,13 @@ pub fn python_path_with_versions(
     temp_dir: &ChildPath,
     python_versions: &[&str],
 ) -> anyhow::Result<OsString> {
-    let download_list = ManagedPythonDownloadList::new_only_embedded().unwrap();
+    let download_list = if python_versions.is_empty() {
+        None
+    } else {
+        Some(ManagedPythonDownloadList::new_only_embedded()?)
+    };
     Ok(env::join_paths(
-        python_installations_for_versions(temp_dir, python_versions, &download_list)?
+        python_installations_for_versions(temp_dir, python_versions, download_list.as_ref())?
             .into_iter()
             .map(|path| path.parent().unwrap().to_path_buf()),
     )?)
@@ -2266,12 +2292,15 @@ pub fn python_path_with_versions(
 fn python_installations_for_versions(
     temp_dir: &ChildPath,
     python_versions: &[&str],
-    download_list: &ManagedPythonDownloadList,
+    download_list: Option<&ManagedPythonDownloadList>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let cache = Cache::from_path(temp_dir.child("cache").to_path_buf())
         .init_no_wait()?
         .expect("No cache contention when setting up Python in tests");
     let _preview = uv_preview::test::with_features(&[]);
+    let Some(download_list) = download_list else {
+        return Ok(Vec::new());
+    };
     let selected_pythons = python_versions
         .iter()
         .map(|python_version| {
@@ -2776,5 +2805,44 @@ mod cache_directory_tests {
             .env_remove(EnvVars::UV_CACHE_DIR);
 
         assert_effective_cache_directory(&command);
+    }
+}
+
+#[cfg(test)]
+mod file_read_tests {
+    use std::path::PathBuf;
+
+    use assert_fs::prelude::*;
+
+    use super::TestContext;
+
+    #[test]
+    fn reads_non_utf8_bytes() -> anyhow::Result<()> {
+        let context = TestContext::new_with_versions_and_bin(&[], PathBuf::from("uv"));
+        let bytes = [0, 0xff, 0x80, b'\n'];
+        context.temp_dir.child("binary").write_binary(&bytes)?;
+
+        assert_eq!(context.read_bytes("binary"), bytes);
+
+        Ok(())
+    }
+
+    #[test]
+    fn reads_absolute_path_outside_project() -> anyhow::Result<()> {
+        let context = TestContext::new_with_versions_and_bin(&[], PathBuf::from("uv"));
+        let file = context.cache_dir.child("binary");
+        file.write_binary(&[0xff, 0])?;
+
+        assert_eq!(context.read_bytes(file), [0xff, 0]);
+
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(expected = "Failed to read `missing.bin`")]
+    fn reports_missing_file() {
+        let context = TestContext::new_with_versions_and_bin(&[], PathBuf::from("uv"));
+
+        context.read_bytes("missing.bin");
     }
 }

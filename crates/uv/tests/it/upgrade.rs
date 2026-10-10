@@ -86,6 +86,10 @@ fn upgrade_help() {
               Attempt to use `keyring` for authentication for index URLs [env: UV_KEYRING_PROVIDER=]
               [possible values: disabled, subprocess]
 
+    Build options:
+          --require-build-hashes     Require hashes for all build dependencies
+          --no-require-build-hashes  Do not require hashes for every build dependency
+
     Cache options:
       -n, --no-cache               Avoid reading from or writing to the cache, instead using a temporary
                                    directory for the duration of the operation [env: UV_NO_CACHE=]
@@ -489,7 +493,7 @@ fn upgrade_updates_requirement_without_updating_lockfile_or_environment() -> Res
     let environment_sentinel = context.venv.child("sentinel");
     environment_sentinel.write_str("present")?;
 
-    let lock = fs_err::read(context.temp_dir.child("uv.lock"))?;
+    let lock = context.read_bytes("uv.lock");
 
     uv_snapshot!(
         context.filters(),
@@ -509,7 +513,7 @@ fn upgrade_updates_requirement_without_updating_lockfile_or_environment() -> Res
         context.read("pyproject.toml"),
         pyproject_toml.replace("anyio<=2", "anyio<=4.3.0")
     );
-    assert_eq!(fs_err::read(context.temp_dir.child("uv.lock"))?, lock);
+    assert_eq!(context.read_bytes("uv.lock"), lock);
     let lock_contents = context.read("uv.lock");
     assert!(
         lock_contents.contains("name = \"idna\"\nversion = \"2.10\""),
@@ -577,8 +581,8 @@ fn upgrade_reports_no_version_change_without_mutation() -> Result<()> {
     ");
     fs_err::remove_dir_all(&context.venv)?;
 
-    let pyproject = fs_err::read(context.temp_dir.child("pyproject.toml"))?;
-    let lock = fs_err::read(context.temp_dir.child("uv.lock"))?;
+    let pyproject = context.read_bytes("pyproject.toml");
+    let lock = context.read_bytes("uv.lock");
 
     uv_snapshot!(context.filters(), context.upgrade().arg("anyio"), @"
     exit_code: 0 (success)
@@ -588,11 +592,8 @@ fn upgrade_reports_no_version_change_without_mutation() -> Result<()> {
     No version change for anyio
     ");
 
-    assert_eq!(
-        fs_err::read(context.temp_dir.child("pyproject.toml"))?,
-        pyproject
-    );
-    assert_eq!(fs_err::read(context.temp_dir.child("uv.lock"))?, lock);
+    assert_eq!(context.read_bytes("pyproject.toml"), pyproject);
+    assert_eq!(context.read_bytes("uv.lock"), lock);
     assert!(!context.temp_dir.child(".venv").exists());
     Ok(())
 }
