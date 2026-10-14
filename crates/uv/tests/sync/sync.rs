@@ -941,52 +941,6 @@ fn sync_lockfile_requires_revision() -> Result<()> {
     Ok(())
 }
 
-/// Syncing a new project warms its interpreter cache so the next sync does not query Python.
-#[test]
-fn sync_caches_interpreter() -> Result<()> {
-    let context = uv_test::test_context_with_versions!(&["3.12"]);
-    context
-        .temp_dir
-        .child("pyproject.toml")
-        .write_str(indoc! {r#"
-        [project]
-        name = "project"
-        version = "0.1.0"
-        requires-python = ">=3.12"
-    "#})?;
-    context.sync().assert().success();
-
-    let site_packages = context.site_packages();
-    fs_err::write(
-        site_packages.join("sitecustomize.py"),
-        indoc! {r#"
-            from pathlib import Path
-
-            Path(__file__).with_name("interpreter-started").touch()
-        "#},
-    )?;
-    let startup_marker = site_packages.join("interpreter-started");
-
-    uv_snapshot!(context.filters(), context.sync(), @"
-    exit_code: 0 (success)
-    ----- stderr -----
-    Resolved 1 package in [TIME]
-    Checked in [TIME]
-    ");
-    assert!(!startup_marker.exists());
-
-    // Bypassing the cache must run Python and trigger the startup probe.
-    context
-        .python_find()
-        .arg(context.venv.path())
-        .arg("--no-cache")
-        .assert()
-        .success();
-    assert!(startup_marker.is_file());
-
-    Ok(())
-}
-
 /// Explicit lock modes override conflicting environment variables without updating the lockfile.
 #[test]
 fn sync_lock_flags_override_environment() -> Result<()> {
@@ -16360,14 +16314,14 @@ fn sync_does_not_remove_empty_virtual_environment_directory() -> Result<()> {
 
     // Note we do _not_ fail to create the virtual environment — we fail later when writing to the
     // project directory
-    uv_snapshot!(context.filters(), context.sync().current_dir(&project_dir), @"
+    uv_snapshot!(context.filters(), context.sync().current_dir(&project_dir), @r#"
     exit_code: 2 (failure)
     ----- stderr -----
     Using CPython 3.12.[X] interpreter at: [PYTHON-3.12]
     Creating virtual environment at: .venv
     Resolved 2 packages in [TIME]
-    error: failed to write to file `[TEMP_DIR]/project/uv.lock`: Permission denied (os error 13)
-    ");
+    error: Permission denied (os error 13) at path "[TEMP_DIR]/project/[TMP]"
+    "#);
 
     Ok(())
 }

@@ -1,6 +1,6 @@
 [package]
 name = "uv-pypi-types"
-version = "0.0.92"
+version = "0.0.93"
 description = "This is an internal component crate of uv"
 edition = { workspace = true }
 rust-version = { workspace = true }
@@ -36,7 +36,6 @@ rkyv = { workspace = true }
 rustc-hash = { workspace = true }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true }
-serde-untagged = { workspace = true }
 thiserror = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
