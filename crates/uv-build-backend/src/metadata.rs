@@ -421,44 +421,33 @@ impl PyProjectToml {
         self.project.readme.as_ref()
     }
 
-    /// The license files that need to be included in the source distribution.
-    pub(crate) fn license_files_source_dist(&self) -> impl Iterator<Item = &str> {
-        let license_file = self
-            .project
+    /// The pre-PEP 639 license file, which is included in the source distribution.
+    pub(crate) fn legacy_license_file(&self) -> Option<&str> {
+        self.project
             .license
             .as_ref()
             .and_then(|license| license.file())
-            .into_iter();
-        let license_files = self
-            .project
-            .license_files
-            .iter()
-            .flatten()
-            .map(String::as_str);
-        license_files.chain(license_file)
     }
 
-    /// The license files that need to be included in the wheel.
-    pub(crate) fn license_files_wheel(&self) -> impl Iterator<Item = &str> {
-        // The pre-PEP 639 `license = { file = "..." }` is included inline in `METADATA`.
-        self.project
-            .license_files
-            .iter()
-            .flatten()
-            .map(String::as_str)
+    /// Borrow the configured settings, or construct defaults when the table is absent.
+    pub(crate) fn settings(&self) -> Cow<'_, BuildBackendSettings> {
+        self.tool
+            .as_ref()
+            .and_then(|tool| tool.uv.as_ref())
+            .and_then(|uv| uv.build_backend.as_ref())
+            .map_or_else(
+                || Cow::Owned(BuildBackendSettings::default()),
+                Cow::Borrowed,
+            )
     }
 
-    pub(crate) fn settings(&self) -> Option<&BuildBackendSettings> {
-        self.tool.as_ref()?.uv.as_ref()?.build_backend.as_ref()
-    }
-
-    /// See [`BuildSystem::check_build_system`].
-    pub(crate) fn check_build_system(
-        &self,
-        uv_version: &str,
-        build_kind: BuildKind,
-    ) -> Vec<String> {
-        self.build_system.check_build_system(uv_version, build_kind)
+    /// Warn if the build-system table is inconsistent with the running backend.
+    pub(crate) fn warn_build_system(&self, uv_version: &str, build_kind: BuildKind) {
+        if uv_warnings::is_enabled() {
+            for warning in self.build_system.check_build_system(uv_version, build_kind) {
+                warn_user_once!("{warning}");
+            }
+        }
     }
 
     /// Validate and convert a `pyproject.toml` to core metadata.
@@ -797,18 +786,8 @@ impl PyProjectToml {
                     .strip_prefix(root)
                     .expect("walkdir starts with root");
 
-                if !license_globs.match_path(relative) {
-                    trace!("Not a license files match: {}", relative.user_display());
-                    continue;
-                }
-
-                let file_type = entry.file_type();
-
-                if !(file_type.is_file() || file_type.is_symlink()) {
-                    trace!(
-                        "Not a file or symlink in license files match: {}",
-                        relative.user_display()
-                    );
+                if !license_globs.match_file(relative) || !entry.path().is_file() {
+                    trace!("Not a license file match: {}", relative.user_display());
                     continue;
                 }
 
@@ -1762,6 +1741,7 @@ mod tests {
         let pyproject_toml: PyProjectToml = toml::from_str(&contents).unwrap();
         assert_snapshot!(
             pyproject_toml
+                .build_system
                 .check_build_system("0.4.15+test", BuildKind::Wheel)
                 .join("\n"),
             @""
@@ -1782,18 +1762,21 @@ mod tests {
         let pyproject_toml: PyProjectToml = toml::from_str(contents).unwrap();
         assert_snapshot!(
             pyproject_toml
+                .build_system
                 .check_build_system("0.4.15+test", BuildKind::Wheel)
                 .join("\n"),
             @""
         );
         assert_snapshot!(
             pyproject_toml
+                .build_system
                 .check_build_system("0.4.15+test", BuildKind::Editable)
                 .join("\n"),
             @""
         );
         assert_snapshot!(
             pyproject_toml
+                .build_system
                 .check_build_system("0.4.15+test", BuildKind::Sdist)
                 .join("\n"),
             @r#"`build_system.requires = ["uv_build"]` is missing an upper bound on the `uv_build` version such as `<0.5`. Without bounding the `uv_build` version, the source distribution will break when a future, breaking version of `uv_build` is released."#
@@ -1814,6 +1797,7 @@ mod tests {
         let pyproject_toml: PyProjectToml = toml::from_str(contents).unwrap();
         assert_snapshot!(
             pyproject_toml
+                .build_system
                 .check_build_system("0.4.15+test", BuildKind::Wheel)
                 .join("\n"),
             @"Expected `build-system.requires` to contain only `uv_build`, found `uv-build>=0.4.15,<0.5.0`, `wheel`"
@@ -1834,6 +1818,7 @@ mod tests {
         let pyproject_toml: PyProjectToml = toml::from_str(contents).unwrap();
         assert_snapshot!(
             pyproject_toml
+                .build_system
                 .check_build_system("0.4.15+test", BuildKind::Wheel)
                 .join("\n"),
             @"Expected `build-system.requires` to be `uv_build`, found `setuptools`"
@@ -1854,6 +1839,7 @@ mod tests {
         let pyproject_toml: PyProjectToml = toml::from_str(contents).unwrap();
         assert_snapshot!(
             pyproject_toml
+                .build_system
                 .check_build_system("0.4.15+test", BuildKind::Wheel)
                 .join("\n"),
             @r#"`build_system.build-backend` was expected to be `"uv_build"`, not `"setuptools"`"#
