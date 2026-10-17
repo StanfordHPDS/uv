@@ -11,9 +11,8 @@ use reqwest_retry::{
 };
 use rustls::{AlertDescription, Error as RustlsError};
 use tracing::{debug, trace};
-use url::Url;
 
-use uv_redacted::DisplaySafeUrl;
+use uv_redacted::SafeUrl;
 
 use crate::{RequestBuilder, WrappedReqwestError};
 
@@ -34,11 +33,11 @@ impl RetryableStrategy for UvRetryableStrategy {
                 Ok(response) => {
                     debug!(
                         "Transient request failure for: {}",
-                        DisplaySafeUrl::ref_cast(response.url())
+                        SafeUrl::ref_cast(response.url())
                     );
                 }
                 Err(err) => {
-                    let url = request_error_url(err).map(DisplaySafeUrl::ref_cast);
+                    let url = request_error_url(err);
                     let redact = |message: &str| {
                         url.map_or_else(|| message.to_owned(), |url| url.redact_in(message))
                     };
@@ -62,12 +61,12 @@ pub struct RetryState {
     retry_policy: ExponentialBackoff,
     start_time: SystemTime,
     total_retries: u32,
-    url: DisplaySafeUrl,
+    url: SafeUrl,
 }
 
 impl RetryState {
     /// Initialize the [`RetryState`] and record the start time for the retry policy.
-    pub fn start(retry_policy: ExponentialBackoff, url: impl Into<DisplaySafeUrl>) -> Self {
+    pub fn start(retry_policy: ExponentialBackoff, url: impl Into<SafeUrl>) -> Self {
         Self {
             retry_policy,
             start_time: SystemTime::now(),
@@ -197,12 +196,12 @@ pub fn retryable_on_request_failure(err: &(dyn Error + 'static)) -> Option<Retry
     {
         trace!(
             "Considering retry of response HTTP {status} for `{url}`",
-            url = DisplaySafeUrl::from_url(url.clone())
+            url = SafeUrl::from_url(url.clone())
         );
     } else if let Some(url) = request_error_url(err) {
         trace!(
             "Considering retry of error: {}",
-            DisplaySafeUrl::ref_cast(url).redact_in(&format!("{err:?}"))
+            url.redact_in(&format!("{err:?}"))
         );
     } else {
         trace!("Considering retry of error: {err:?}");
@@ -345,7 +344,7 @@ fn is_tls_certificate_error(reqwest_err: &reqwest::Error) -> bool {
 }
 
 /// Finds the request URL for diagnostics, including transparent middleware and retry wrappers.
-fn request_error_url<'a>(err: &'a (dyn Error + 'static)) -> Option<&'a Url> {
+fn request_error_url<'a>(err: &'a (dyn Error + 'static)) -> Option<&'a SafeUrl> {
     iter::successors(Some(err), |&err| {
         if let Some(io_error) = err.downcast_ref::<io::Error>()
             && let Some(inner) = io_error.get_ref()
@@ -367,6 +366,7 @@ fn request_error_url<'a>(err: &'a (dyn Error + 'static)) -> Option<&'a Url> {
                     .and_then(|err| err.url())
             })
     })
+    .map(SafeUrl::ref_cast)
 }
 
 /// Find the first source error of a specific type, including errors wrapped by [`io::Error`].

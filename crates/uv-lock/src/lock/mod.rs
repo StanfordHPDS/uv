@@ -17,7 +17,6 @@ use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, instrument, trace};
-use url::Url;
 
 use uv_cache_key::RepositoryUrl;
 use uv_configuration::{
@@ -61,7 +60,7 @@ use uv_pypi_types::{
     ConflictItem, ConflictKindRef, ConflictSet, Conflicts, HashAlgorithm, HashDigest, HashDigests,
     ParsedArchiveUrl, ParsedGitDirectoryUrl, ParsedGitPathUrl, PyProjectToml,
 };
-use uv_redacted::{DisplaySafeUrl, DisplaySafeUrlError};
+use uv_redacted::{SafeUrl, SafeUrlError};
 use uv_resolver_types::{
     AnnotatedDist, ConflictMarker, DistributionMetadataIndex, MetadataResponse, PackageRole,
     ResolutionGraphNode, ResolverOutput, UniversalMarker,
@@ -6756,7 +6755,7 @@ impl Package {
                     Source::Direct(url, direct) => {
                         let filename: WheelFilename =
                             self.wheels[best_wheel_index].filename.clone();
-                        let url = DisplaySafeUrl::from(ParsedArchiveUrl {
+                        let url = SafeUrl::from(ParsedArchiveUrl {
                             url: url.to_url().map_err(LockErrorKind::InvalidUrl)?,
                             subdirectory: direct.subdirectory.clone(),
                             ext: DistExtension::Wheel,
@@ -6794,7 +6793,7 @@ impl Package {
                         )?;
 
                         // Reconstruct the PEP 508-compatible URL from the `GitSource`.
-                        let url = DisplaySafeUrl::from(ParsedGitPathUrl {
+                        let url = SafeUrl::from(ParsedGitPathUrl {
                             url: git_url.clone(),
                             install_path: install_path.clone(),
                             ext: DistExtension::Wheel,
@@ -7012,7 +7011,7 @@ impl Package {
                     };
 
                     // Reconstruct the PEP 508-compatible URL from the `GitSource`.
-                    let url = DisplaySafeUrl::from(ParsedGitPathUrl {
+                    let url = SafeUrl::from(ParsedGitPathUrl {
                         url: git_url.clone(),
                         install_path: install_path.clone(),
                         ext: DistExtension::Source(ext),
@@ -7028,7 +7027,7 @@ impl Package {
                     uv_distribution_types::SourceDist::GitPath(git_dist)
                 } else {
                     // Reconstruct the PEP 508-compatible URL from the `GitSource`.
-                    let url = DisplaySafeUrl::from(ParsedGitDirectoryUrl {
+                    let url = SafeUrl::from(ParsedGitDirectoryUrl {
                         url: git_url.clone(),
                         subdirectory: git.subdirectory.clone(),
                     });
@@ -7061,7 +7060,7 @@ impl Package {
                     .into());
                 }
                 let location = url.to_url().map_err(LockErrorKind::InvalidUrl)?;
-                let url = DisplaySafeUrl::from(ParsedArchiveUrl {
+                let url = SafeUrl::from(ParsedArchiveUrl {
                     url: location.clone(),
                     subdirectory: direct.subdirectory.clone(),
                     ext: DistExtension::Source(ext),
@@ -7151,12 +7150,11 @@ impl Package {
                         path: file_path, ..
                     } => {
                         let file_path = workspace_root.join(path).join(file_path);
-                        let file_url =
-                            DisplaySafeUrl::from_file_path(&file_path).map_err(|()| {
-                                LockErrorKind::PathToUrl {
-                                    path: file_path.into_boxed_path(),
-                                }
-                            })?;
+                        let file_url = SafeUrl::from_file_path(&file_path).map_err(|()| {
+                            LockErrorKind::PathToUrl {
+                                path: file_path.into_boxed_path(),
+                            }
+                        })?;
                         FileLocation::AbsoluteUrl(UrlString::from(file_url))
                     }
                     SourceDist::Metadata { .. } => {
@@ -7841,9 +7839,9 @@ impl Source {
                 Ok(Self::Registry(source))
             }
             IndexUrl::Path(url) => {
-                let path = url
-                    .to_file_path()
-                    .map_err(|()| LockErrorKind::UrlToPath { url: url.to_url() })?;
+                let path = url.to_file_path().map_err(|()| LockErrorKind::UrlToPath {
+                    url: url.to_url().into_url(),
+                })?;
                 let path = try_relative_to_if(&path, root, url.prefers_relative())
                     .map_err(LockErrorKind::IndexRelativePath)?;
                 let source = RegistrySource::Path(path.into_boxed_path());
@@ -7933,7 +7931,7 @@ impl Source {
                 let expected = expected
                     .to_file_path()
                     .map_err(|()| LockErrorKind::UrlToPath {
-                        url: expected.to_url(),
+                        url: expected.to_url().into_url(),
                     })?;
                 normalize_path(root.join(actual)).as_ref() == normalize_path(expected).as_ref()
             }
@@ -7955,7 +7953,7 @@ impl Source {
                 actual.remove_credentials();
                 let mut expected = location.clone();
                 expected.remove_credentials();
-                normalize_url(actual) == normalize_url(expected)
+                normalize_url(actual) == normalize_url(expected.into_url())
                     && source.subdirectory == *subdirectory
             }
             (Self::Path(path), RequirementSource::Path { install_path, .. }) => {
@@ -8171,7 +8169,7 @@ impl TryFrom<SourceWire> for Source {
         match wire {
             Registry { registry } => Ok(Self::Registry(registry.into())),
             Git { git } => {
-                let url = DisplaySafeUrl::parse(&git)
+                let url = SafeUrl::parse(&git)
                     .map_err(|err| SourceParseError::InvalidUrl {
                         given: git.clone(),
                         err,
@@ -8333,7 +8331,7 @@ enum GitSourceError {
 impl GitSource {
     /// Extracts a Git source reference from the query pairs and the hash
     /// fragment in the given URL.
-    fn from_url(url: &Url) -> Result<Self, GitSourceError> {
+    fn from_url(url: &SafeUrl) -> Result<Self, GitSourceError> {
         let mut kind = GitSourceKind::DefaultBranch;
         let mut subdirectory = None;
         let mut lfs = GitLfs::Disabled;
@@ -8609,9 +8607,9 @@ impl SourceDist {
                 }))
             }
             IndexUrl::Path(path) => {
-                let index_path = path
-                    .to_file_path()
-                    .map_err(|()| LockErrorKind::UrlToPath { url: path.to_url() })?;
+                let index_path = path.to_file_path().map_err(|()| LockErrorKind::UrlToPath {
+                    url: path.to_url().into_url(),
+                })?;
                 let url = reg_dist
                     .file
                     .url
@@ -8745,12 +8743,8 @@ impl From<GitSourceKind> for GitReference {
     }
 }
 
-/// Construct the lockfile-compatible [`DisplaySafeUrl`] for a [`GitUrl`].
-fn locked_git_url(
-    git: &GitUrl,
-    subdirectory: Option<&Path>,
-    path: Option<&Path>,
-) -> DisplaySafeUrl {
+/// Construct the lockfile-compatible [`SafeUrl`] for a [`GitUrl`].
+fn locked_git_url(git: &GitUrl, subdirectory: Option<&Path>, path: Option<&Path>) -> SafeUrl {
     let mut url = git.url().clone();
 
     // Remove the credentials.
@@ -8933,9 +8927,9 @@ impl Wheel {
                 WheelWireSource::Url { url }
             }
             IndexUrl::Path(path) => {
-                let index_path = path
-                    .to_file_path()
-                    .map_err(|()| LockErrorKind::UrlToPath { url: path.to_url() })?;
+                let index_path = path.to_file_path().map_err(|()| LockErrorKind::UrlToPath {
+                    url: path.to_url().into_url(),
+                })?;
                 let wheel_url = wheel.file.url.to_url().map_err(LockErrorKind::InvalidUrl)?;
 
                 if wheel_url.scheme() == "file" {
@@ -9061,12 +9055,11 @@ impl Wheel {
                     }
                     WheelWireSource::Path { path: file_path } => {
                         let file_path = root.join(index_path).join(file_path);
-                        let file_url =
-                            DisplaySafeUrl::from_file_path(&file_path).map_err(|()| {
-                                LockErrorKind::PathToUrl {
-                                    path: file_path.into_boxed_path(),
-                                }
-                            })?;
+                        let file_url = SafeUrl::from_file_path(&file_path).map_err(|()| {
+                            LockErrorKind::PathToUrl {
+                                path: file_path.into_boxed_path(),
+                            }
+                        })?;
                         FileLocation::AbsoluteUrl(UrlString::from(file_url))
                     }
                     WheelWireSource::Filename { .. } => {
@@ -9418,8 +9411,8 @@ fn normalize_file_location(location: &FileLocation) -> Result<UrlString, ToUrlEr
     }
 }
 
-/// Convert a [`DisplaySafeUrl`] into a normalized [`UrlString`] by removing the fragment.
-fn normalize_url(mut url: DisplaySafeUrl) -> UrlString {
+/// Convert a [`SafeUrl`] into a normalized [`UrlString`] by removing the fragment.
+fn normalize_url(mut url: SafeUrl) -> UrlString {
     url.set_fragment(None);
     UrlString::from(url)
 }
@@ -10128,7 +10121,7 @@ enum LockErrorKind {
     PathToUrl { path: Box<Path> },
     /// An error that occurs when converting a URL to a path
     #[error("Failed to convert URL to path: {url}", url = url.cyan())]
-    UrlToPath { url: DisplaySafeUrl },
+    UrlToPath { url: SafeUrl },
     /// An error that occurs when multiple packages with the same
     /// name were found when identifying the root packages.
     #[error("Found multiple packages matching `{name}`", name = name.cyan())]
@@ -10222,7 +10215,7 @@ enum SourceParseError {
         given: String,
         /// The URL parse error.
         #[source]
-        err: DisplaySafeUrlError,
+        err: SafeUrlError,
     },
     /// An error that occurs when a Git URL is missing a precise commit SHA.
     #[error("Missing SHA in source `{given}`")]
@@ -10632,7 +10625,7 @@ mod tests {
 
     #[test]
     fn git_source_rejects_mismatched_exact_revision() -> Result<(), Box<dyn Error>> {
-        let url = Url::parse(
+        let url = SafeUrl::parse(
             "https://example.com/repository?rev=0dacfd662c64cb4ceb16e6cf65a157a8b715b979#b270df1a2fb5d012294e9aaf05e7e0bab1e6a389",
         )?;
         assert_eq!(
@@ -10643,17 +10636,17 @@ mod tests {
             })
         );
 
-        let url = Url::parse(
+        let url = SafeUrl::parse(
             "https://example.com/repository?rev=0DACFD662C64CB4CEB16E6CF65A157A8B715B979#0dacfd662c64cb4ceb16e6cf65a157a8b715b979",
         )?;
         assert!(GitSource::from_url(&url).is_ok());
 
-        let url = Url::parse(
+        let url = SafeUrl::parse(
             "https://example.com/repository?rev=0dacfd6#b270df1a2fb5d012294e9aaf05e7e0bab1e6a389",
         )?;
         assert!(GitSource::from_url(&url).is_ok());
 
-        let url = Url::parse(
+        let url = SafeUrl::parse(
             "https://example.com/repository?branch=0dacfd662c64cb4ceb16e6cf65a157a8b715b979#b270df1a2fb5d012294e9aaf05e7e0bab1e6a389",
         )?;
         assert!(GitSource::from_url(&url).is_ok());
@@ -10694,7 +10687,7 @@ wheels = [{ filename = "local-1.0.0-py3-none-any.whl", hash = "sha256:53a42340ae
         let remote = "https://example.com/remote-1.0.0-py3-none-any.whl"
             .parse()
             .expect("valid URL");
-        let local = DisplaySafeUrl::from_file_path(root.join("local-1.0.0-py3-none-any.whl"))
+        let local = SafeUrl::from_file_path(root.join("local-1.0.0-py3-none-any.whl"))
             .expect("valid file URL");
         let unknown = "https://example.com/unknown-1.0.0-py3-none-any.whl"
             .parse()

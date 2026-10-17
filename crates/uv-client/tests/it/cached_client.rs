@@ -6,14 +6,15 @@ use std::{assert_matches, io};
 
 use anyhow::{Result, anyhow};
 use reqwest::Response;
-use wiremock::matchers::{any, header, method, path};
+use wiremock::matchers::{any, header, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use uv_cache::CacheEntry;
+use uv_cache::{Cache, CacheEntry};
 use uv_client::{
-    BaseClientBuilder, CacheControl, CachedClient, CachedClientError, DataWithCachePolicy,
-    ErrorKind, RetryState,
+    BaseClientBuilder, CacheControl, CachedClient, CachedClientError, Connectivity,
+    DataWithCachePolicy, ErrorKind, FlatIndexClient, RetryState,
 };
+use uv_distribution_types::IndexUrl;
 
 #[test]
 fn reject_invalid_cache_lengths() {
@@ -31,13 +32,80 @@ async fn cached_text(
     control: CacheControl,
 ) -> Result<String> {
     let url = format!("{}/metadata", server.uri()).parse()?;
-    let request = client.uncached().for_host(&url).get(url.as_str()).build()?;
+    let request = client.uncached().for_host(&url).get(url).build()?;
     client
         .get_serde_with_retry(request, entry, control, async |response, _| {
             response.text().await
         })
         .await
         .map_err(|err| anyhow!("{err:?}"))
+}
+
+/// Cacheable flat-index responses whose URLs differ only in a redacted query value can both be used
+/// offline.
+#[tokio::test]
+async fn flat_indexes_with_sensitive_queries_are_cached_separately() -> Result<()> {
+    let server = MockServer::start().await;
+    let cache = Cache::temp()?.init().await?;
+    let client = CachedClient::new(BaseClientBuilder::default().build()?);
+    let flat_index = FlatIndexClient::new(&client, Connectivity::Online, &cache);
+    let first = IndexUrl::parse(&format!("{}/flat?sig=first", server.uri()), None)?;
+    let second = IndexUrl::parse(&format!("{}/flat?sig=second", server.uri()), None)?;
+
+    Mock::given(method("GET"))
+        .and(path("/flat"))
+        .and(query_param("sig", "first"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("cache-control", "public, max-age=3600")
+                .set_body_string(
+                    r#"<a href="first-1.0.0-py3-none-any.whl">first-1.0.0-py3-none-any.whl</a>"#,
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/flat"))
+        .and(query_param("sig", "second"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("cache-control", "public, max-age=3600")
+                .set_body_string(
+                    r#"<a href="second-1.0.0-py3-none-any.whl">second-1.0.0-py3-none-any.whl</a>"#,
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    flat_index.fetch_all(std::iter::once(&first)).await?;
+    flat_index.fetch_all(std::iter::once(&second)).await?;
+    server.verify().await;
+
+    let client = CachedClient::new(
+        BaseClientBuilder::default()
+            .connectivity(Connectivity::Offline)
+            .build()?,
+    );
+    let flat_index = FlatIndexClient::new(&client, Connectivity::Offline, &cache);
+    let (entries, offline) = flat_index
+        .fetch_all([&first, &second].into_iter())
+        .await?
+        .into_parts();
+    assert!(!offline);
+    let filenames = entries
+        .iter()
+        .map(|entry| entry.filename().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        filenames,
+        [
+            "first-1.0.0-py3-none-any.whl",
+            "second-1.0.0-py3-none-any.whl"
+        ]
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -412,7 +480,7 @@ async fn assert_retry_budget(
                 .build()?,
         );
         let url = server.uri().parse()?;
-        let request = client.uncached().for_host(&url).get(server.uri()).build()?;
+        let request = client.uncached().for_host(&url).get(url).build()?;
         let callback_retries = RefCell::new(Vec::new());
         let callback = async |response: Response, retry_state: &mut RetryState| {
             response.bytes().await.map_err(io::Error::other)?;
@@ -486,7 +554,7 @@ async fn send_counts_middleware_retries() -> Result<()> {
             .no_retry_delay(true)
             .build()?;
         let url = server.uri().parse()?;
-        let request = client.for_host(&url).get(server.uri());
+        let request = client.for_host(&url).get(url.clone());
         let mut retry_state = RetryState::start(client.retry_policy(), url);
         let result = retry_state.send(request).await;
         assert_eq!(result.is_err(), network_error);
@@ -525,7 +593,7 @@ async fn revalidation_http_errors_share_retry_budget() -> Result<()> {
         )
         .mount(&server)
         .await;
-    let request = client.uncached().for_host(&url).get(url.as_str()).build()?;
+    let request = client.uncached().for_host(&url).get(url.clone()).build()?;
     let result = client
         .get_serde_with_retry(
             request,
@@ -544,7 +612,7 @@ async fn revalidation_http_errors_share_retry_budget() -> Result<()> {
         .expect(3)
         .mount(&server)
         .await;
-    let request = client.uncached().for_host(&url).get(url.as_str()).build()?;
+    let request = client.uncached().for_host(&url).get(url).build()?;
     let result = client
         .get_serde_with_retry(
             request,
