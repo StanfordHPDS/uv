@@ -31,7 +31,7 @@ use uv_fs::{PortablePath, Simplified};
 use uv_install_wheel::validate_and_heal_record;
 use uv_redacted::SafeUrl;
 use uv_static::EnvVars;
-use uv_test::archive::write_tar_gz;
+use uv_test::archive::{generate_source_archive, write_tar_gz};
 #[cfg(feature = "test-git")]
 use uv_test::decode_token;
 use uv_test::find_links::FindLinksServer;
@@ -6419,6 +6419,7 @@ fn invalidate_editable_on_change() -> Result<()> {
     // Create an editable package.
     let editable_dir = context.temp_dir.child("editable");
     editable_dir.create_dir_all()?;
+    editable_dir.child("src/example/__init__.py").touch()?;
     let pyproject_toml = editable_dir.child("pyproject.toml");
     pyproject_toml.write_str(
         r#"[project]
@@ -6428,6 +6429,10 @@ dependencies = [
   "anyio==4.0.0"
 ]
 requires-python = ">=3.8"
+
+[build-system]
+requires = ["uv_build>=0.7,<10000"]
+build-backend = "uv_build"
 "#,
     )?;
 
@@ -6465,6 +6470,10 @@ dependencies = [
   "anyio==3.7.1"
 ]
 requires-python = ">=3.8"
+
+[build-system]
+requires = ["uv_build>=0.7,<10000"]
+build-backend = "uv_build"
 "#,
     )?;
 
@@ -6552,6 +6561,7 @@ fn invalidate_path_on_change() -> Result<()> {
     // Create a local package.
     let editable_dir = context.temp_dir.child("editable");
     editable_dir.create_dir_all()?;
+    editable_dir.child("src/example/__init__.py").touch()?;
     let pyproject_toml = editable_dir.child("pyproject.toml");
     pyproject_toml.write_str(
         r#"[project]
@@ -6561,6 +6571,10 @@ dependencies = [
   "anyio==4.0.0"
 ]
 requires-python = ">=3.8"
+
+[build-system]
+requires = ["uv_build>=0.7,<10000"]
+build-backend = "uv_build"
 "#,
     )?;
 
@@ -6598,6 +6612,10 @@ dependencies = [
   "anyio==3.7.1"
 ]
 requires-python = ">=3.8"
+
+[build-system]
+requires = ["uv_build>=0.7,<10000"]
+build-backend = "uv_build"
 "#,
     )?;
 
@@ -6630,6 +6648,7 @@ fn invalidate_path_on_cache_key() -> Result<()> {
     // Create a local package.
     let editable_dir = context.temp_dir.child("editable");
     editable_dir.create_dir_all()?;
+    editable_dir.child("src/example/__init__.py").touch()?;
     let pyproject_toml = editable_dir.child("pyproject.toml");
     pyproject_toml.write_str(
         r#"[project]
@@ -6637,6 +6656,10 @@ fn invalidate_path_on_cache_key() -> Result<()> {
         version = "0.0.0"
         dependencies = ["anyio==4.0.0"]
         requires-python = ">=3.8"
+
+        [build-system]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
 
         [tool.uv]
         cache-keys = ["constraints.txt", { file = "overrides.txt" }]
@@ -6716,6 +6739,10 @@ fn invalidate_path_on_cache_key() -> Result<()> {
         dependencies = ["anyio==4.0.0"]
         requires-python = ">=3.8"
 
+        [build-system]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
+
         [tool.uv]
         cache-keys = [{ file = "overrides.txt" }, "constraints.txt"]
 "#,
@@ -6738,6 +6765,10 @@ fn invalidate_path_on_cache_key() -> Result<()> {
         version = "0.0.0"
         dependencies = ["anyio==4.0.0"]
         requires-python = ">=3.8"
+
+        [build-system]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
 
         [tool.uv]
         cache-keys = [{ file = "**/*.txt" }]
@@ -6881,12 +6912,17 @@ fn invalidate_path_on_env_var() -> Result<()> {
     requirements_txt.write_str(".")?;
 
     // Create a local package.
+    context.temp_dir.child("src/example/__init__.py").touch()?;
     context.temp_dir.child("pyproject.toml").write_str(
         r#"[project]
         name = "example"
         version = "0.0.0"
         dependencies = ["anyio==4.0.0"]
         requires-python = ">=3.8"
+
+        [build-system]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
 
         [tool.uv]
         cache-keys = [{ env = "FOO" }]
@@ -9231,17 +9267,28 @@ async fn reject_wheel_with_multiple_dist_info_directories() -> Result<()> {
     Ok(())
 }
 
-/// Sync using `--find-links` with a local directory, with wheels disabled.
+/// Install an sdist from a local directory instead of a newer wheel when wheels are disabled.
 #[test]
-fn find_links_no_binary() {
+fn find_links_no_binary() -> Result<()> {
     let context = uv_test::test_context!("3.12");
+    let links = context.temp_dir.child("links");
+    links.create_dir_all()?;
+    let source = generate_source_archive(&"tqdm".parse()?, &"999.0.0".parse()?, "", None)?;
+    links.child("tqdm-999.0.0.tar.gz").write_binary(&source)?;
+    fs_err::copy(
+        context
+            .workspace_root
+            .join("test/links/tqdm-1000.0.0-py3-none-any.whl"),
+        links.child("tqdm-1000.0.0-py3-none-any.whl"),
+    )?;
 
     uv_snapshot!(context.filters(), context.pip_install()
         .arg("tqdm")
         .arg("--no-binary")
         .arg(":all:")
+        .arg("--no-index")
         .arg("--find-links")
-        .arg(context.workspace_root.join("test/links/")), @"
+        .arg(links.path()), @"
     exit_code: 0 (success)
     ----- stderr -----
     Resolved 1 package in [TIME]
@@ -9250,6 +9297,8 @@ fn find_links_no_binary() {
      + tqdm==999.0.0
     "
     );
+
+    Ok(())
 }
 
 /// Provide valid hashes for all dependencies with `--require-hashes`.
