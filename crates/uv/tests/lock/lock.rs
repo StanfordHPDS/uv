@@ -1,5 +1,4 @@
 #[cfg(feature = "test-universal")]
-use std::collections::BTreeMap;
 #[cfg(all(feature = "test-universal", feature = "test-git"))]
 use std::process::Command;
 
@@ -32,7 +31,7 @@ use uv_test::archive::{generate_source_archive, write_tar_gz};
 #[cfg(feature = "test-universal")]
 use uv_test::package_server::PackageServer;
 #[cfg(feature = "test-universal")]
-use uv_test::packse::{PackseServer, generate_wheel_with_files, scenario::Scenario};
+use uv_test::packse::{PackseServer, WheelBuilder, scenario::Scenario};
 #[cfg(all(feature = "test-universal", feature = "test-git"))]
 use uv_test::{READ_ONLY_GITHUB_TOKEN, decode_token};
 use uv_test::{diff_snapshot, uv_snapshot};
@@ -1589,13 +1588,14 @@ fn lock_sdist_git_archive() -> Result<()> {
         dependencies = ["iniconfig"]
 
         [build-system]
-        requires = ["setuptools>=42"]
-        build-backend = "setuptools.build_meta"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
 
         [tool.uv.sources]
         iniconfig = { git = "https://github.com/astral-sh/archive-in-git-test", path = "archives/iniconfig-2.0.0.tar.gz" }
         "#,
     )?;
+    context.temp_dir.child("src/project/__init__.py").touch()?;
 
     uv_snapshot!(context.filters(), context.sync(), @r###"
     exit_code: 0 (success)
@@ -1731,13 +1731,14 @@ fn lock_wheel_git_archive() -> Result<()> {
         dependencies = ["iniconfig"]
 
         [build-system]
-        requires = ["setuptools>=42"]
-        build-backend = "setuptools.build_meta"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
 
         [tool.uv.sources]
         iniconfig = { git = "https://github.com/astral-sh/archive-in-git-test", path = "archives/iniconfig-2.0.0-py3-none-any.whl" }
         "#,
     )?;
+    context.temp_dir.child("src/project/__init__.py").touch()?;
 
     uv_snapshot!(context.filters(), context.lock(), @r###"
     exit_code: 0 (success)
@@ -2094,15 +2095,9 @@ fn lock_sdist_url() -> Result<()> {
 /// Create a deterministic wheel whose module can be imported by a source build backend.
 #[cfg(feature = "test-universal")]
 fn locked_build_dependency_wheel(module: &str) -> Result<Vec<u8>> {
-    let (_, wheel) = generate_wheel_with_files(
-        &"review-dep".parse()?,
-        &"1.0.0".parse()?,
-        &[],
-        &BTreeMap::new(),
-        None,
-        "py3-none-any",
-        &[("review_dep/payload.py", module)],
-    );
+    let (_, wheel) = WheelBuilder::new(&"review-dep".parse()?, &"1.0.0".parse()?)
+        .files(&[("review_dep/payload.py", module)])
+        .build();
     Ok(wheel)
 }
 
@@ -2537,15 +2532,9 @@ fn lock_wheel_path_relock_hash_mismatch() -> Result<()> {
     let name = "demo-pkg".parse()?;
     let version = "1.0.0".parse()?;
     let [(filename, trusted), (_, replacement)] = ["original", "replacement"].map(|contents| {
-        generate_wheel_with_files(
-            &name,
-            &version,
-            &[],
-            &BTreeMap::new(),
-            None,
-            "py3-none-any",
-            &[("demo_pkg/data.txt", contents)],
-        )
+        WheelBuilder::new(&name, &version)
+            .files(&[("demo_pkg/data.txt", contents)])
+            .build()
     });
     let archive = context.temp_dir.child(&filename);
     let trusted_digest = hex::encode(Sha256::digest(&trusted));
@@ -5950,13 +5939,11 @@ fn lock_conflicting_workspace_members() -> Result<()> {
         ]
 
         [build-system]
-        requires = ["setuptools>=42"]
-        build-backend = "setuptools.build_meta"
-
-        [tool.setuptools.packages.find]
-        include = ["example"]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
     )?;
+    context.temp_dir.child("src/example/__init__.py").touch()?;
 
     // Create the subproject
     let subproject_dir = context.temp_dir.child("subexample");
@@ -5972,10 +5959,11 @@ fn lock_conflicting_workspace_members() -> Result<()> {
         dependencies = ["sortedcontainers==2.4.0"]
 
         [build-system]
-        requires = ["setuptools>=42"]
-        build-backend = "setuptools.build_meta"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
     )?;
+    subproject_dir.child("src/subexample/__init__.py").touch()?;
 
     // Lock should succeed because we declared the conflict
     uv_snapshot!(context.filters(), context.lock(), @"
@@ -6201,13 +6189,11 @@ fn lock_conflicting_workspace_members_depends_direct_extra() -> Result<()> {
         subexample = { workspace = true }
 
         [build-system]
-        requires = ["setuptools>=42"]
-        build-backend = "setuptools.build_meta"
-
-        [tool.setuptools.packages.find]
-        include = ["example"]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
     )?;
+    context.temp_dir.child("src/example/__init__.py").touch()?;
 
     // Create the subproject
     let subproject_dir = context.temp_dir.child("subexample");
@@ -6223,10 +6209,11 @@ fn lock_conflicting_workspace_members_depends_direct_extra() -> Result<()> {
         dependencies = ["sortedcontainers==2.4.0"]
 
         [build-system]
-        requires = ["setuptools>=42"]
-        build-backend = "setuptools.build_meta"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
     )?;
+    subproject_dir.child("src/subexample/__init__.py").touch()?;
 
     // This should succeed, because the conflict is optional
     uv_snapshot!(context.filters(), context.lock(), @"
@@ -6493,13 +6480,11 @@ fn lock_conflicting_workspace_members_depends_transitive_extra() -> Result<()> {
         indirection = { workspace = true }
 
         [build-system]
-        requires = ["setuptools>=42"]
-        build-backend = "setuptools.build_meta"
-
-        [tool.setuptools.packages.find]
-        include = ["example"]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
     )?;
+    context.temp_dir.child("src/example/__init__.py").touch()?;
 
     // Create the indirection subproject
     let subproject_dir = context.temp_dir.child("indirection");
@@ -6521,10 +6506,13 @@ fn lock_conflicting_workspace_members_depends_transitive_extra() -> Result<()> {
         subexample = { workspace = true }
 
         [build-system]
-        requires = ["setuptools>=42"]
-        build-backend = "setuptools.build_meta"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
     )?;
+    subproject_dir
+        .child("src/indirection/__init__.py")
+        .touch()?;
 
     // Create the incompatible subproject
     let subproject_dir = context.temp_dir.child("subexample");
@@ -6540,10 +6528,11 @@ fn lock_conflicting_workspace_members_depends_transitive_extra() -> Result<()> {
         dependencies = ["sortedcontainers==2.4.0"]
 
         [build-system]
-        requires = ["setuptools>=42"]
-        build-backend = "setuptools.build_meta"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
     )?;
+    subproject_dir.child("src/subexample/__init__.py").touch()?;
 
     // This succeeds, but should fail. We have an unconditional conflict via `example ->
     // indirection[foo] -> subexample`, so `example` is unusable.
@@ -18309,16 +18298,39 @@ fn lock_sources_archive() -> Result<()> {
 fn lock_sources_source_tree() -> Result<()> {
     let context = uv_test::test_context!("3.12");
 
-    // Download the source.
-    let workspace_archive = context.temp_dir.child("workspace.zip");
-    download_to_disk(
-        "https://github.com/user-attachments/files/16592193/workspace.zip",
-        &workspace_archive,
-    );
+    let workspace = context.temp_dir.child("workspace");
+    workspace.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "workspace"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["anyio"]
 
-    // Unzip the file.
-    let file = fs_err::File::open(&*workspace_archive)?;
-    uv_extract::unzip(file, &context.temp_dir)?;
+        [build-system]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
+
+        [tool.uv.workspace]
+        members = ["anyio"]
+
+        [tool.uv.sources]
+        anyio = { workspace = true }
+    "#})?;
+    workspace.child("src/workspace/__init__.py").touch()?;
+
+    let anyio = workspace.child("anyio");
+    anyio.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "anyio"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = []
+
+        [build-system]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
+    "#})?;
+    anyio.child("src/anyio/__init__.py").touch()?;
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(&formatdoc! {
@@ -18330,17 +18342,12 @@ fn lock_sources_source_tree() -> Result<()> {
         dependencies = ["workspace @ file://{}"]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
-
-        [tool.hatch.metadata]
-        allow-direct-references = true
-
-        [tool.hatch.build.targets.wheel]
-        packages = ["src/project"]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
         context.temp_dir.child("workspace").portable_display()
     })?;
+    context.temp_dir.child("src/project/__init__.py").touch()?;
 
     uv_snapshot!(context.filters(), context.lock(), @"
     exit_code: 0 (success)
@@ -18601,8 +18608,8 @@ fn lock_mixed_extras() -> Result<()> {
         async = ["iniconfig>=2"]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#})?;
     leaf1.child("src/leaf1/__init__.py").touch()?;
 
@@ -18616,8 +18623,8 @@ fn lock_mixed_extras() -> Result<()> {
         dependencies = ["leaf2"]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
 
         [tool.uv.sources]
         leaf2 = { workspace = true }
@@ -18639,8 +18646,8 @@ fn lock_mixed_extras() -> Result<()> {
         async = ["packaging>=24"]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#})?;
     leaf2.child("src/leaf2/__init__.py").touch()?;
 
@@ -18825,8 +18832,8 @@ fn lock_transitive_extra() -> Result<()> {
         async = ["iniconfig>=2"]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#})?;
     leaf.child("src/leaf/__init__.py").touch()?;
 
@@ -46628,15 +46635,9 @@ fn lock_resolution_inputs_local_source_constraints() -> Result<()> {
     "#})?;
     let server = PackseServer::from_scenario(&scenario);
     let context = uv_test::test_context!("3.12");
-    let (filename, wheel) = generate_wheel_with_files(
-        &"provider".parse()?,
-        &"1.0.0".parse()?,
-        &["b==1.0.0a1".parse()?],
-        &BTreeMap::new(),
-        None,
-        "py3-none-any",
-        &[],
-    );
+    let (filename, wheel) = WheelBuilder::new(&"provider".parse()?, &"1.0.0".parse()?)
+        .requires(&["b==1.0.0a1".parse()?])
+        .build();
     context.temp_dir.child(&filename).write_binary(&wheel)?;
     let pyproject = context.temp_dir.child("pyproject.toml");
     let source = SafeUrl::from_file_path(context.temp_dir.child(&filename).path())

@@ -50,7 +50,7 @@ use uv_test::assert_link_target;
 use uv_test::diff_snapshot;
 use uv_test::package_server::PackageServer;
 use uv_test::packse::scenario::{ArtifactMetadata, Package, PackageMetadata, Scenario};
-use uv_test::packse::{PackseServer, generate_wheel};
+use uv_test::packse::{PackseServer, WheelBuilder};
 use uv_test::{
     DEFAULT_PYTHON_VERSION, TestContext, copy_dir_ignore, download_to_disk, uv_snapshot,
 };
@@ -2071,6 +2071,26 @@ fn compile_python_invalid_version() -> Result<()> {
     For more information, try '--help'.
     "
     );
+
+    Ok(())
+}
+
+#[test]
+fn compile_python_version_too_many_components() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    context
+        .temp_dir
+        .child("requirements.in")
+        .write_str("anyio")?;
+
+    uv_snapshot!(context.pip_compile()
+        .arg("requirements.in")
+        .arg("--python-version")
+        .arg("3.12.1.1"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Invalid version request: 3.12.1.1
+    ");
 
     Ok(())
 }
@@ -18195,6 +18215,27 @@ fn compile_invalid_output_file() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn pep_751_root_output_path() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    context.temp_dir.child("requirements.in").touch()?;
+
+    uv_snapshot!(context
+        .pip_compile()
+        .arg("requirements.in")
+        .arg("--format")
+        .arg("pylock.toml")
+        .arg("-o")
+        .arg("/"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Expected the output filename to be `pylock.toml` or `pylock.<name>.toml`, where `<name>` is non-empty and contains no dots; found `/`
+    ");
+
+    Ok(())
+}
+
 #[cfg(feature = "test-universal")]
 #[test]
 fn pep_751_filename() -> Result<()> {
@@ -18351,8 +18392,8 @@ fn pep_751_compile_directory() -> Result<()> {
         dependencies = ["anyio"]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
     )?;
     context
@@ -20219,31 +20260,18 @@ fn overrides_preserve_alternative_optional_extras() -> Result<()> {
 
     // The host requests the same dependency from either optional extra.
     let wheels = context.temp_dir.child("wheels");
-    let (filename, wheel) = generate_wheel(
-        &"extra-host".parse()?,
-        &"1".parse()?,
-        &["extra-leaf==1; extra == 'a' or extra == 'b'".parse()?],
-        &BTreeMap::from([
+    let (filename, wheel) = WheelBuilder::new(&"extra-host".parse()?, &"1".parse()?)
+        .requires(&["extra-leaf==1; extra == 'a' or extra == 'b'".parse()?])
+        .extras(&BTreeMap::from([
             ("a".parse()?, Vec::new()),
             ("b".parse()?, Vec::new()),
             ("unrelated".parse()?, Vec::new()),
-        ]),
-        None,
-        "py3-none-any",
-        &[],
-    );
+        ]))
+        .build();
     wheels.child(filename).write_binary(&wheel)?;
 
     // The override selects a different version of the optional dependency.
-    let (filename, wheel) = generate_wheel(
-        &"extra-leaf".parse()?,
-        &"2".parse()?,
-        &[],
-        &BTreeMap::new(),
-        None,
-        "py3-none-any",
-        &[],
-    );
+    let (filename, wheel) = WheelBuilder::new(&"extra-leaf".parse()?, &"2".parse()?).build();
     wheels.child(filename).write_binary(&wheel)?;
 
     context

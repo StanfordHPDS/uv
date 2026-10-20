@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fmt::Write;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -36,7 +35,9 @@ use uv_test::archive::{generate_source_archive, write_tar_gz};
 use uv_test::decode_token;
 use uv_test::find_links::FindLinksServer;
 use uv_test::package_server::PackageServer;
-use uv_test::packse::{PackseServer, generate_wheel, generate_wheel_with_files};
+#[cfg(feature = "test-universal")]
+use uv_test::packse::scenario::Scenario;
+use uv_test::packse::{PackseServer, WheelBuilder};
 use uv_test::{
     DEFAULT_PYTHON_VERSION, TestContext, apply_filters, copy_dir_ignore, download_to_disk, get_bin,
     uv_snapshot, venv_bin_path,
@@ -190,18 +191,12 @@ fn install_wheel_script_with_shell_launcher_preserves_encoding_cookie() -> Resul
 #[cfg(unix)]
 fn install_ascii_wheel_script_in_non_ascii_environment() -> Result<()> {
     let context = uv_test::test_context_with_versions!(&["3.12"]);
-    let (filename, wheel) = generate_wheel_with_files(
-        &"ascii-script".parse()?,
-        &"1.0.0".parse()?,
-        &[],
-        &BTreeMap::default(),
-        None,
-        "py3-none-any",
-        &[(
+    let (filename, wheel) = WheelBuilder::new(&"ascii-script".parse()?, &"1.0.0".parse()?)
+        .files(&[(
             "ascii_script-1.0.0.data/scripts/ascii-script",
             "#!python\n# coding: ascii\nprint('ok')\n",
-        )],
-    );
+        )])
+        .build();
     fs::write(context.temp_dir.join(&filename), wheel)?;
 
     let venv = context.temp_dir.join("café env");
@@ -233,18 +228,12 @@ fn install_ascii_wheel_script_in_non_ascii_environment() -> Result<()> {
 #[cfg(unix)]
 fn install_wheel_script_does_not_execute_decoded_interpreter_path() -> Result<()> {
     let context = uv_test::test_context_with_versions!(&["3.12"]);
-    let (filename, wheel) = generate_wheel_with_files(
-        &"encoded-script".parse()?,
-        &"1.0.0".parse()?,
-        &[],
-        &BTreeMap::default(),
-        None,
-        "py3-none-any",
-        &[(
+    let (filename, wheel) = WheelBuilder::new(&"encoded-script".parse()?, &"1.0.0".parse()?)
+        .files(&[(
             "encoded_script-1.0.0.data/scripts/encoded-script",
             "#!python\n# coding: utf-7\nprint('ok')\n",
-        )],
-    );
+        )])
+        .build();
     fs::write(context.temp_dir.join(&filename), wheel)?;
 
     let venv = context
@@ -3168,8 +3157,8 @@ fn install_git_checkout_marker_symlink() -> Result<()> {
         requires-python = ">=3.12"
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#})?;
     repository
         .child("src/example/__init__.py")
@@ -3240,8 +3229,8 @@ fn install_git_full_commit_ignores_same_named_branch() -> Result<()> {
         requires-python = ">=3.12"
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#})?;
     repository
         .child("src/example/__init__.py")
@@ -3291,8 +3280,8 @@ fn install_git_full_commit_ignores_same_named_branch() -> Result<()> {
         requires-python = ">=3.12"
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#})?;
     repository
         .child("src/example/__init__.py")
@@ -3514,8 +3503,11 @@ fn install_git_percent_encoded_ref() -> Result<()> {
         requires-python = ">=3.12"
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
+
+        [tool.uv.build-backend]
+        module-root = ""
     "#})?;
 
     Command::new("git")
@@ -4520,6 +4512,54 @@ fn install_build_policy_cache() {
     );
 }
 
+/// A cached wheel uploaded after the cutoff must not replace the source distribution
+/// selected by the resolver.
+#[cfg(feature = "test-universal")]
+#[test]
+fn exclude_newer_does_not_reuse_cached_wheel() -> Result<()> {
+    let scenario = toml::from_str::<Scenario>(indoc! {r#"
+        name = "exclude-newer-cached-wheel"
+
+        [root]
+
+        [expected]
+        satisfiable = true
+
+        [packages.a.versions."1.0.0"]
+        sdist = { upload_time = "2024-03-24T00:00:00Z" }
+        wheel = { upload_time = "2024-03-24T12:00:00Z" }
+    "#})?;
+    let server = PackseServer::from_scenario(&scenario);
+    let context = uv_test::test_context!("3.12");
+
+    // Cache the published wheel, then clear the environment but keep the cache.
+    context
+        .pip_install()
+        .arg("a")
+        .arg("--index-url")
+        .arg(server.index_url())
+        .arg("--only-binary")
+        .arg(":all:")
+        .assert()
+        .success();
+    context.reset_venv();
+
+    // The cutoff falls between the two uploads, so we must prepare a wheel from the source.
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("a")
+        .arg("--index-url").arg(server.index_url())
+        .arg("--exclude-newer").arg("2024-03-24T06:00:00Z"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + a==1.0.0
+    ");
+
+    Ok(())
+}
+
 /// Respect `--only-binary` flags in `requirements.txt`
 #[test]
 fn only_binary_requirements_txt() {
@@ -4819,15 +4859,9 @@ fn install_copy_long_paths() -> Result<()> {
             let context = TestContext::new_with_bin("3.10", uv_bin.clone());
             let destination = context.site_packages().join(&file);
             assert!(destination.as_os_str().encode_wide().count() > 260);
-            let (filename, wheel) = generate_wheel_with_files(
-                &"long-paths".parse()?,
-                &"1.0.0".parse()?,
-                &[],
-                &BTreeMap::default(),
-                None,
-                "py3-none-any",
-                &[(&file, "data")],
-            );
+            let (filename, wheel) = WheelBuilder::new(&"long-paths".parse()?, &"1.0.0".parse()?)
+                .files(&[(&file, "data")])
+                .build();
             fs::write(context.temp_dir.join(&filename), wheel)?;
 
             // Both the destination and the temporary-file path can exceed MAX_PATH. Neither
@@ -6835,10 +6869,15 @@ fn invalidate_path_on_worktree_packed_commit() -> Result<()> {
         dependencies = ["anyio==4.0.0"]
         requires-python = ">=3.8"
 
+        [build-system]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
+
         [tool.uv]
         cache-keys = [{ git = true }]
         "#,
     )?;
+    editable_dir.child("src/example/__init__.py").touch()?;
 
     // Create a linked worktree with the branch reference in the common Git directory's
     // `packed-refs` file.
@@ -7108,8 +7147,13 @@ dependencies = [
   "anyio @ https://files.pythonhosted.org/packages/2d/b8/7333d87d5f03247215d86a86362fd3e324111788c6cdd8d2e6196a6ba833/anyio-4.2.0.tar.gz ; python_version < '3.11'"
 ]
 requires-python = ">=3.11,<3.13"
+
+[build-system]
+requires = ["uv_build>=0.7,<10000"]
+build-backend = "uv_build"
 "#,
     )?;
+    editable_dir.child("src/example/__init__.py").touch()?;
 
     uv_snapshot!(context.filters(), context.pip_install()
         .arg("--editable")
@@ -7181,8 +7225,8 @@ dependencies = []
 requires-python = ">=3.13"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["uv_build>=0.7,<10000"]
+build-backend = "uv_build"
 "#,
     )?;
     child_dir.child("src").child("example").create_dir_all()?;
@@ -10728,24 +10772,8 @@ fn verify_hashes_public_pin_local_version() -> Result<()> {
     let name = "hash-probe".parse()?;
     let public_version = "1.0.0".parse()?;
     let local_version = "1.0.0+local".parse()?;
-    let (_, public_wheel) = generate_wheel(
-        &name,
-        &public_version,
-        &[],
-        &BTreeMap::default(),
-        None,
-        "py3-none-any",
-        &[],
-    );
-    let (local_wheel_filename, local_wheel) = generate_wheel(
-        &name,
-        &local_version,
-        &[],
-        &BTreeMap::default(),
-        None,
-        "py3-none-any",
-        &[],
-    );
+    let (_, public_wheel) = WheelBuilder::new(&name, &public_version).build();
+    let (local_wheel_filename, local_wheel) = WheelBuilder::new(&name, &local_version).build();
     let public_hash = hex::encode(Sha256::digest(&public_wheel));
     let local_hash = hex::encode(Sha256::digest(&local_wheel));
     let context = context
@@ -11185,7 +11213,12 @@ fn recursive_extra_transitive_url() -> Result<()> {
         docs = [
             "iniconfig @ https://files.pythonhosted.org/packages/ef/a6/62565a6e1cf69e10f5727360368e451d4b7f58beeac6173dc9db836a5b46/iniconfig-2.0.0-py3-none-any.whl",
         ]
+
+        [build-system]
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#})?;
+    context.temp_dir.child("src/project/__init__.py").touch()?;
 
     uv_snapshot!(context.filters(), context.pip_install()
         .arg(".[all]"), @"
@@ -13823,8 +13856,8 @@ fn no_sources_workspace_discovery() -> Result<()> {
         dependencies = ["anyio"]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
 
         [tool.uv.sources]
         anyio = { workspace = true }
@@ -13848,8 +13881,8 @@ fn no_sources_workspace_discovery() -> Result<()> {
         version = "2.0.0"
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#
     })?;
     anyio
@@ -13972,8 +14005,8 @@ fn pip_install_no_sources_package() -> Result<()> {
         dependencies = ["anyio", "iniconfig"]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
 
         [tool.uv.sources]
         anyio = { git = "https://github.com/agronholm/anyio", tag = "3.7.0" }
@@ -14352,8 +14385,8 @@ fn change_layout_custom_directory() -> Result<()> {
         dependencies = ["iniconfig"]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
 
         [tool.uv]
         cache-keys = [{ dir = "build" }]
@@ -14645,8 +14678,8 @@ fn pep_751_install_directory() -> Result<()> {
         dependencies = ["anyio"]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
     )?;
     context
@@ -16212,8 +16245,8 @@ fn reserved_script_name() -> Result<()> {
         "activate.bash" = "project:activate"
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#,
     )?;
 
@@ -16246,8 +16279,8 @@ fn reserved_script_name() -> Result<()> {
         "python" = "project:python"
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#,
     )?;
 
@@ -16402,15 +16435,9 @@ fn repacked_wheel_with_entrypoint(
     entrypoint_name: &str,
 ) -> Result<PathBuf> {
     let built_wheel = context.temp_dir.join("foo/dist/foo-0.1.0-py3-none-any.whl");
-    let (_, wheel) = generate_wheel(
-        &"foo".parse()?,
-        &"0.1.0".parse()?,
-        &[],
-        &BTreeMap::new(),
-        Some(&">=3.12".parse()?),
-        "py3-none-any",
-        &[],
-    );
+    let (_, wheel) = WheelBuilder::new(&"foo".parse()?, &"0.1.0".parse()?)
+        .requires_python(Some(&">=3.12".parse()?))
+        .build();
     fs::create_dir_all(context.temp_dir.join("foo/dist"))?;
     fs::write(&built_wheel, wheel)?;
 
@@ -17309,8 +17336,8 @@ fn already_installed_url_dependency_no_sources() -> Result<()> {
         dependencies = ["iniconfig"]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#})?;
     context
         .temp_dir
@@ -17332,8 +17359,8 @@ fn already_installed_url_dependency_no_sources() -> Result<()> {
         dependencies = ["foo"]
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
     "#})?;
     context
         .temp_dir
@@ -18052,8 +18079,8 @@ fn pip_install_no_sources_editable_to_registry_switch() -> Result<()> {
         requires-python = ">=3.7"
 
         [build-system]
-        requires = ["hatchling"]
-        build-backend = "hatchling.build"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
     )?;
 
