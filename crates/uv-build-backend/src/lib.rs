@@ -25,13 +25,14 @@ use walkdir::DirEntry;
 
 use uv_fs::{Simplified, normalize_path};
 use uv_globfilter::PortableGlobError;
+use uv_macros::DebugNoInline;
 use uv_normalize::PackageName;
 use uv_pypi_types::{Identifier, IdentifierParseError};
 
 use crate::metadata::ValidationError;
 use crate::settings::ModuleName;
 
-#[derive(Debug, Error)]
+#[derive(DebugNoInline, Error)]
 pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -1008,7 +1009,10 @@ mod tests {
         .unwrap();
         fs_err::write(
             src.path().join("license.txt"),
-            "Copy carefully.\nSincerely, the authors",
+            indoc! {"
+                Copy carefully.
+                Sincerely, the authors
+            "},
         )
         .unwrap();
 
