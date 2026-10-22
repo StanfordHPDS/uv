@@ -3136,6 +3136,29 @@ mod test {
         assert_eq!(simplified, expected);
     }
 
+    /// Render a local-version exclusion combined with an upper bound.
+    #[test]
+    fn local_version_exclusion() {
+        assert_simplifies(
+            "python_full_version not in '3.20+x' and python_full_version < '4'",
+            "python_full_version < '3.20' or (python_full_version > '3.20' and python_full_version < '4')",
+        );
+    }
+
+    /// Local-version containment markers must produce equivalent marker trees after rendering
+    /// and reparsing.
+    #[test]
+    fn local_version_containment_roundtrip() {
+        assert_simplifies(
+            "python_full_version in '3.20+x'",
+            "python_full_version == '3.20'",
+        );
+        assert_simplifies(
+            "python_full_version not in '3.20+x'",
+            "python_full_version != '3.20'",
+        );
+    }
+
     #[test]
     fn test_marker_simplification() {
         assert_false("python_version == '3.9.1'");
