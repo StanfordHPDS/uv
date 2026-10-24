@@ -173,6 +173,16 @@
       "target": "uv"
     },
     {
+      "caller": "uv",
+      "environment": "automations",
+      "caller_ref": "refs/pull/*/merge",
+      "caller_workflow": "ci.yml",
+      "reusable_workflow": "pull-request-code-quality-review.yml",
+      "on": ["pull_request"],
+      "permissions": { "pull_requests": "write" },
+      "target": "uv"
+    },
+    {
       "caller": "uv-dev",
       "environment": "automations",
       "caller_ref": "refs/pull/*/merge",
@@ -241,6 +251,17 @@
       },
       "targets": ["uv", "uv-dev"],
       "installation": "automations"
+    },
+    {
+      "caller": "uv",
+      "environment": "automations",
+      "caller_workflow": "ai-policy.yml",
+      "on": ["workflow_dispatch"],
+      "permissions": {
+        "issues": "write",
+        "pull_requests": "write"
+      },
+      "target": "uv"
     }
   ]
 }
