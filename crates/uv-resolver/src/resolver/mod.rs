@@ -25,8 +25,9 @@ use uv_configuration::{Constraints, DependencyModifiers, IndexStrategy};
 use uv_distribution::{ArchiveMetadata, DistributionDatabase, supported_variant_properties};
 use uv_distribution_types::{
     BuiltDist, DerivationChain, Dist, DistErrorKind, Identifier, IndexCapabilities, IndexLocations,
-    IndexMetadata, IndexUrl, InstalledDist, Name, RemoteSource, Requirement, RequiresPython,
-    ResolutionRecorder, ResolvedDist, SourceDist, VariantsJsonContent, VersionOrUrlRef,
+    IndexMetadata, IndexUrl, InstalledDist, Name, RemoteSource, RequestedDist, Requirement,
+    RequiresPython, ResolutionRecorder, ResolvedDist, SourceDist, VariantsJsonContent,
+    VersionOrUrlRef,
 };
 use uv_git::GitResolver;
 use uv_normalize::PackageName;
@@ -34,7 +35,7 @@ use uv_pep440::{MIN_VERSION, Version, VersionSpecifiers, release_specifiers_to_r
 use uv_pep508::{
     MarkerEnvironment, MarkerExpression, MarkerOperator, MarkerTree, MarkerValueString,
 };
-use uv_platform_tags::{IncompatibleTag, Tags};
+use uv_platform_tags::{IncompatibleTag, TagCompatibility, Tags};
 use uv_preview::PreviewFeature;
 use uv_pypi_types::{ConflictItem, ConflictItemRef, ConflictKindRef, Conflicts, VerbatimParsedUrl};
 use uv_resolver_types::{PackageNodeKind, VariantsJsonMetadataError};
@@ -82,6 +83,7 @@ pub use crate::resolver::provider::{
     DefaultResolverProvider, MetadataResponse, PackageVersionsResult, ResolverProvider,
     VariantsJsonResponse, VersionsResponse, WheelMetadataResult,
 };
+use crate::resolver::provider::{classify_metadata_error, classify_wheel_metadata_error};
 pub use crate::resolver::reporter::Reporter;
 use crate::resolver::requests::{MetadataRequest, MetadataRequests};
 pub(crate) use crate::resolver::requests::{RegisteredMetadata, RegisteredVariantsJson};
@@ -1290,11 +1292,19 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 }
             }
 
-            let incompatible_tag = if filename.variant().is_some() {
-                // Selecting a wheel variant requires variant metadata from the index.
+            let incompatible_tag = if filename.variant().is_some()
+                && (!uv_preview::is_enabled(PreviewFeature::WheelVariants)
+                    || env.marker_environment().is_none())
+            {
+                // Universal lockfiles cannot yet record wheel variants.
                 Some(IncompatibleTag::Variant)
             } else if !python_requirement.target().matches_wheel_tag(filename) {
                 Some(IncompatibleTag::AbiPythonVersion)
+            } else if filename.variant().is_some()
+                && let Some(tags) = &self.tags
+                && let TagCompatibility::Incompatible(tag) = filename.tag_compatibility(tags)
+            {
+                Some(tag)
             } else {
                 None
             };
@@ -1322,6 +1332,30 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                         IncompatibleSource::RequiresPython(requires_python.clone(), kind),
                     )),
                 )));
+            }
+        }
+
+        if let Dist::Built(wheel) = dist
+            && let Some(label) = wheel.wheel_filename().variant().cloned()
+            && let Some(tags) = &self.tags
+            && let Some(variant) = requests.read_wheel_variant(wheel)?
+        {
+            let unavailable = match variant {
+                Ok(variant) => {
+                    let supported = supported_variant_properties(&variant, tags.python_platform());
+                    // TODO(konsti): Include the unsupported properties in the resolver error.
+                    variant
+                        .unsupported_variant_properties(&label, &supported)
+                        .map(|_| {
+                            UnavailableVersion::IncompatibleDist(IncompatibleDist::Wheel(
+                                IncompatibleWheel::Tag(IncompatibleTag::Variant),
+                            ))
+                        })
+                }
+                Err(reason) => Some(self.record_unavailable_metadata(name, version, &reason)),
+            };
+            if let Some(reason) = unavailable {
+                return Ok(Some(ResolverVersion::Unavailable(version.clone(), reason)));
             }
         }
 
@@ -2261,6 +2295,35 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
         provider: &Provider,
     ) -> Result<Option<Response>, ResolveError> {
         match request {
+            // TODO(konsti): This read stands in for a request to evaluate arbitrary providers
+            // off the resolver thread.
+            Request::WheelVariant { wheel, response } => {
+                let result = match provider
+                    .get_wheel_variant_metadata(&wheel)
+                    .boxed_local()
+                    .await
+                {
+                    Ok(metadata) => Ok(metadata.map(Ok)),
+                    Err(uv_distribution::Error::WheelMetadata(_, err)) => {
+                        Ok(Some(Err(classify_wheel_metadata_error(*err))))
+                    }
+                    Err(uv_distribution::Error::Client(err)) => classify_metadata_error(err)
+                        .map(|reason| Some(Err(reason)))
+                        .map_err(uv_distribution::Error::from),
+                    Err(err) => Err(err),
+                }
+                .map_err(|err| {
+                    let dist = Box::new(RequestedDist::Installable(Dist::Built(wheel)));
+                    ResolveError::Dist(
+                        DistErrorKind::from_requested_dist(&dist, &err),
+                        dist,
+                        DerivationChain::default(),
+                        Arc::new(err),
+                    )
+                })?;
+                let _ = response.send(result);
+                Ok(None)
+            }
             Request::VariantsJson(variants_json) => {
                 let response = provider
                     .fetch_variants_json(
@@ -2275,7 +2338,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     VariantsJsonResponse::Found(contents) => {
                         VariantsJsonContent::from_slice(&contents).map_err(|source| {
                             MetadataUnavailable::InvalidVariantMetadata(Arc::new(
-                                VariantsJsonMetadataError {
+                                VariantsJsonMetadataError::Index {
                                     filename: variants_json.filename.clone(),
                                     source,
                                 },
@@ -3532,6 +3595,11 @@ pub(crate) enum Request {
     Installed(InstalledDist),
     /// A request to fetch variant metadata for a selected version.
     VariantsJson(RegistryVariantsJson),
+    /// A request to read embedded variant metadata from a wheel.
+    WheelVariant {
+        wheel: BuiltDist,
+        response: oneshot::Sender<Option<ParsedVariantsJsonResponse>>,
+    },
     /// A request to pre-fetch the metadata for a package and the best-guess distribution.
     Prefetch(PackageName, Range<Version>, PythonRequirement),
 }
@@ -3587,6 +3655,9 @@ impl Display for Request {
             }
             Self::VariantsJson(variants_json) => {
                 write!(f, "Variant metadata `{}`", variants_json.filename)
+            }
+            Self::WheelVariant { wheel, .. } => {
+                write!(f, "Variant metadata `{}`", wheel.wheel_filename())
             }
             Self::Prefetch(package_name, range, _) => {
                 write!(f, "Prefetch {package_name} {range}")
