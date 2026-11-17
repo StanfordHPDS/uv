@@ -22,7 +22,7 @@ use uv_cache::{Cache, CacheBucket, CacheEntry, WheelCache};
 use uv_cache_key::cache_digest;
 use uv_configuration::IndexStrategy;
 use uv_configuration::KeyringProviderType;
-use uv_distribution_filename::{DistFilename, WheelFilename};
+use uv_distribution_filename::{DistFilename, DistFilenameError, WheelFilename};
 use uv_distribution_types::{
     BuiltDist, DirectUrlBuiltDist, FileLocation, IndexCapabilities, IndexEntryFilename,
     IndexFormat, IndexLocations, IndexMetadataRef, IndexStatusCodeDecision,
@@ -393,14 +393,16 @@ impl RegistryClient {
                     let _permit = download_concurrency.acquire().await;
                     match index.format {
                         IndexFormat::Simple => {
-                            let status_code_strategy =
-                                self.indexes.status_code_strategy_for(index.url);
+                            let status_code_strategy = self
+                                .indexes
+                                .request_policy(index.url)
+                                .status_code_strategy();
                             match self
                                 .simple_detail_single_index(
                                     package_name,
                                     index.url,
                                     capabilities,
-                                    &status_code_strategy,
+                                    status_code_strategy,
                                 )
                                 .await?
                             {
@@ -449,7 +451,7 @@ impl RegistryClient {
                                         package_name,
                                         index.url,
                                         capabilities,
-                                        &status_code_strategy,
+                                        status_code_strategy,
                                     )
                                     .await?
                                 {
@@ -564,7 +566,7 @@ impl RegistryClient {
         package_name: &PackageName,
         index: &IndexUrl,
         capabilities: &IndexCapabilities,
-        status_code_strategy: &IndexStatusCodeStrategy,
+        status_code_strategy: IndexStatusCodeStrategy<'_>,
     ) -> Result<SimpleMetadataSearchOutcome, Error> {
         // Format the URL for PyPI.
         let mut url = index.url().clone();
@@ -585,7 +587,10 @@ impl RegistryClient {
         );
         let cache_control = match self.connectivity {
             Connectivity::Online
-                if let Some(header) = self.indexes.simple_api_cache_control_for(index) =>
+                if let Some(header) = self
+                    .indexes
+                    .request_policy(index)
+                    .simple_api_cache_control() =>
             {
                 CacheControl::Override(header)
             }
@@ -840,7 +845,10 @@ impl RegistryClient {
         );
         let cache_control = match self.connectivity {
             Connectivity::Online
-                if let Some(header) = self.indexes.simple_api_cache_control_for(index) =>
+                if let Some(header) = self
+                    .indexes
+                    .request_policy(index)
+                    .simple_api_cache_control() =>
             {
                 CacheControl::Override(header)
             }
@@ -983,7 +991,10 @@ impl RegistryClient {
         // TODO(konsti): Revisit cache freshness once variant metadata mutability is specified.
         let cache_control = match self.connectivity {
             Connectivity::Online
-                if let Some(header) = self.indexes.configured_files_cache_control_for(index) =>
+                if let Some(header) = self
+                    .indexes
+                    .request_policy(index)
+                    .configured_files_cache_control() =>
             {
                 CacheControl::Override(header)
             }
@@ -1453,7 +1464,8 @@ impl RegistryClient {
         Ok(match self.connectivity {
             Connectivity::Online
                 if let Some(index) = effective_index
-                    && let Some(header) = self.indexes.artifact_cache_control_for(index) =>
+                    && let Some(header) =
+                        self.indexes.request_policy(index).artifact_cache_control() =>
             {
                 CacheControl::Override(header)
             }
@@ -1803,6 +1815,9 @@ impl SimpleIndexMetadata {
 pub struct SimpleDetailMetadata {
     project_status: ProjectStatus,
     versions: Vec<SimpleDetailMetadatum>,
+    /// One rejected wheel name, for diagnostics if resolution fails.
+    #[rkyv(with = rkyv::with::Niche)]
+    mismatched_wheel_name: Option<Box<PackageName>>,
 }
 
 #[derive(Debug, rkyv::Archive, rkyv::Deserialize, rkyv::Serialize)]
@@ -1826,6 +1841,7 @@ impl SimpleDetailMetadata {
         base: &SafeUrl,
     ) -> Self {
         let mut version_map: BTreeMap<Version, VersionFiles> = BTreeMap::default();
+        let mut mismatched_wheel_name: Option<Box<PackageName>> = None;
 
         // Convert to a reference-counted string.
         let base = SmallString::from(base.as_str());
@@ -1838,6 +1854,13 @@ impl SimpleDetailMetadata {
             ) {
                 Ok(filename) => filename,
                 Err(err) => {
+                    if let DistFilenameError::WheelNameMismatch { actual, .. } = &err
+                        && mismatched_wheel_name
+                            .as_deref()
+                            .is_none_or(|name| actual < name)
+                    {
+                        mismatched_wheel_name = Some(Box::new(actual.clone()));
+                    }
                     debug!(
                         "Skipping file for {package_name}: {:?} ({err})",
                         file.filename
@@ -1888,6 +1911,7 @@ impl SimpleDetailMetadata {
                 })
                 .collect(),
             project_status,
+            mismatched_wheel_name,
         }
     }
 
@@ -1925,6 +1949,14 @@ impl ArchivedSimpleDetailMetadata {
 
     pub fn datum(&self, i: usize) -> Option<&rkyv::Archived<SimpleDetailMetadatum>> {
         self.versions.get(i)
+    }
+
+    /// Return an example of a wheel name that did not match the requested project.
+    pub fn mismatched_wheel_name(&self) -> Option<PackageName> {
+        self.mismatched_wheel_name.as_deref().map(|name| {
+            rkyv::deserialize::<PackageName, rkyv::rancor::Error>(name)
+                .expect("archived package name always deserializes")
+        })
     }
 
     /// Return the project-level [PEP 792] status marker for this package.
@@ -2339,6 +2371,92 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_project_files() -> Result<(), Error> {
+        let expected = PackageName::from_str("example")?;
+        let actual = PackageName::from_str("other")?;
+        let base = SafeUrl::parse("https://example.com/simple/example/")?;
+        let wrong_files = vec![
+            serde_json::json!({
+                "filename": "zother-1-py3-none-any.whl",
+                "url": "/download",
+                "hashes": {}
+            }),
+            serde_json::json!({
+                "filename": "other-1-py3-none-any.whl",
+                "url": "/download",
+                "hashes": {}
+            }),
+            serde_json::json!({
+                "filename": "other-2-py3-none-any.whl",
+                "url": "https://example.com/files/other-2-py3-none-any.whl#fragment",
+                "hashes": {}
+            }),
+        ];
+        let parse = |files, name: &PackageName| -> Result<SimpleDetailMetadata, Error> {
+            let data: PypiSimpleDetail =
+                serde_json::from_value(serde_json::json!({ "files": files }))?;
+            Ok(SimpleDetailMetadata::from_pypi_files(
+                data.files,
+                name,
+                data.project_status,
+                &base,
+            ))
+        };
+
+        let json = parse(wrong_files.clone(), &expected)?;
+        assert_eq!(json.iter().count(), 0);
+        assert_eq!(json.mismatched_wheel_name.as_deref(), Some(&actual));
+        let archived = super::OwnedArchive::from_unarchived(&json)?;
+        assert_eq!(archived.mismatched_wheel_name(), Some(actual.clone()));
+
+        let html = SimpleDetailMetadata::from_html(
+            r#"<base href="https://cdn.example.com/files/"><a href="other-1-py3-none-any.whl">other-1-py3-none-any.whl</a>"#,
+            &expected,
+            &base,
+        )?;
+        assert_eq!(html.iter().count(), 0);
+        assert_eq!(html.mismatched_wheel_name.as_deref(), Some(&actual));
+
+        // Archived files are validated against the requested project when read.
+        let mut cached = parse(wrong_files.clone(), &actual)?;
+        let archived = super::OwnedArchive::from_unarchived(&cached)?;
+        let cached_files = super::OwnedArchive::deserialize(&archived);
+        assert_eq!(
+            cached_files
+                .versions
+                .into_iter()
+                .flat_map(|datum| datum.files.all(&expected))
+                .count(),
+            0
+        );
+
+        let valid_file = serde_json::json!({
+            "filename": "example-3.tar.gz",
+            "url": "example-3.tar.gz",
+            "hashes": {}
+        });
+        let mut mixed_files = wrong_files;
+        mixed_files.push(valid_file.clone());
+        let mixed = parse(mixed_files, &expected)?;
+        assert_eq!(mixed.iter().count(), 1);
+        assert_eq!(mixed.mismatched_wheel_name.as_deref(), Some(&actual));
+
+        cached
+            .versions
+            .extend(parse(vec![valid_file], &expected)?.versions);
+        let archived = super::OwnedArchive::from_unarchived(&cached)?;
+        let cached = super::OwnedArchive::deserialize(&archived);
+        let filenames: Vec<_> = cached
+            .versions
+            .into_iter()
+            .flat_map(|datum| datum.files.all(&expected))
+            .map(|(filename, _)| filename.to_string())
+            .collect();
+        assert_eq!(filenames, ["example-3.tar.gz"]);
+        Ok(())
+    }
+
+    #[test]
     fn distribution_files_round_trip() -> Result<(), Error> {
         let response = r#"
         {
@@ -2595,6 +2713,7 @@ mod tests {
                     metadata: None,
                 },
             ],
+            mismatched_wheel_name: None,
         }
         "#);
     }
@@ -2669,6 +2788,7 @@ mod tests {
                     metadata: None,
                 },
             ],
+            mismatched_wheel_name: None,
         }
         "#);
     }
