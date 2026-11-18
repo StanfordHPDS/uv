@@ -25,9 +25,9 @@ use uv_distribution_filename::{
 };
 use uv_distribution_types::{
     BuiltDist, CanonicalFileLocation, DirectUrlBuiltDist, DirectUrlSourceDist, DirectorySourceDist,
-    Dist, Edge, FirstParty, GitDirectorySourceDist, IndexUrl, Name, Node, PathBuiltDist,
-    PathSourceDist, RegistryBuiltDist, RegistryBuiltWheel, RegistrySourceDist, RemoteSource,
-    RequiresPython, Resolution, ResolvedDist, SourceDist, ToUrlError, UrlString,
+    Dist, Edge, File, FirstParty, GitDirectorySourceDist, IndexLocations, IndexUrl, Name, Node,
+    PathBuiltDist, PathSourceDist, RegistryBuiltDist, RegistryBuiltWheel, RegistrySourceDist,
+    RemoteSource, RequiresPython, Resolution, ResolvedDist, SourceDist, ToUrlError, UrlString,
 };
 use uv_fs::{PortablePathBuf, normalize_path, try_relative_to_if};
 use uv_git::{RepositoryReference, ResolvedRepositoryReference};
@@ -46,7 +46,7 @@ use uv_resolver_types::ResolverOutput;
 
 use crate::lock::export::{ExportableRequirements, VirtualPackages};
 use crate::lock::{Source, WheelTagHint, is_wheel_unreachable};
-use crate::{Installable, LockError};
+use crate::{Installable, LockError, LockHashError};
 
 /// Format an array so that each element is on its own line and has a trailing comma.
 fn each_element_on_its_line_array(elements: impl Iterator<Item = impl Into<Value>>) -> Array {
@@ -186,6 +186,8 @@ pub enum PylockTomlErrorKind {
     #[error(transparent)]
     GitUrlParse(#[from] GitUrlParseError),
     #[error(transparent)]
+    Hash(#[from] LockHashError),
+    #[error(transparent)]
     LockError(#[from] LockError),
     #[error(transparent)]
     Extension(#[from] ExtensionError),
@@ -258,7 +260,11 @@ pub struct PylockToml {
     #[serde(deserialize_with = "deserialize_lock_version")]
     lock_version: Version,
     created_by: String,
-    #[serde(skip_serializing)]
+    #[serde(
+        skip_serializing,
+        default,
+        deserialize_with = "deserialize_environments"
+    )]
     environments: Option<Vec<MarkerTree>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requires_python: Option<RequiresPython>,
@@ -271,6 +277,19 @@ pub struct PylockToml {
     pub packages: Vec<PylockTomlPackage>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     attestation_identities: Vec<PylockTomlAttestationIdentity>,
+}
+
+fn deserialize_environments<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<MarkerTree>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(transparent)]
+    struct Environments(
+        #[serde(deserialize_with = "MarkerTree::deserialize_environment_list")] Vec<MarkerTree>,
+    );
+
+    Option::<Environments>::deserialize(deserializer)
+        .map(|environments| environments.map(|env| env.0))
 }
 
 fn deserialize_lock_version<'de, D>(deserializer: D) -> Result<Version, D::Error>
@@ -331,6 +350,7 @@ pub struct PylockTomlPackage {
     #[serde(
         skip_serializing_if = "uv_pep508::marker::ser::is_empty",
         serialize_with = "uv_pep508::marker::ser::serialize",
+        deserialize_with = "MarkerTree::deserialize_environment",
         default
     )]
     marker: MarkerTree,
@@ -464,6 +484,7 @@ impl<'lock> PylockToml {
         install_path: &Path,
         tags: Option<&Tags>,
         build_options: &BuildOptions,
+        index_locations: &IndexLocations,
     ) -> Result<Self, PylockTomlErrorKind> {
         // The lock version is always `1.0` at time of writing.
         let lock_version = Version::new([1, 0]);
@@ -501,6 +522,15 @@ impl<'lock> PylockToml {
                 .as_ref()
                 .filter(|_| !matches!(&**dist, Dist::Source(SourceDist::Directory(..))));
 
+            // Retain the canonical index so a later install can find its configured proxy.
+            // `packages.index` applies to every file for this version. If a proxy and `--find-links`
+            // both supply files, selecting a proxied file can make uv reject a `--find-links` URL;
+            // selecting a `--find-links` file can make uv download a proxied file directly.
+            let index = dist
+                .index()
+                .filter(|index| index_locations.proxy_route_for(index).is_some())
+                .map(|index| index.url().clone().with_policy(Stripped));
+
             // Create a `pylock.toml`-style package.
             let mut package = PylockTomlPackage {
                 name: dist.name().clone(),
@@ -508,7 +538,7 @@ impl<'lock> PylockToml {
                 marker: node.marker.pep508(),
                 requires_python: None,
                 dependencies: vec![],
-                index: None,
+                index,
                 vcs: None,
                 directory: None,
                 archive: None,
@@ -558,6 +588,7 @@ impl<'lock> PylockToml {
                         node_index,
                         &dist.wheels,
                         build_options.no_binary_package(dist.name()),
+                        index_locations,
                     )?;
 
                     // Filter sdist based on build options (--only-binary).
@@ -565,6 +596,12 @@ impl<'lock> PylockToml {
 
                     if !no_build {
                         if let Some(sdist) = dist.sdist.as_ref() {
+                            Self::validate_proxy_artifact(
+                                index_locations,
+                                &sdist.index,
+                                &sdist.name,
+                                &sdist.file,
+                            )?;
                             let url = sdist
                                 .file
                                 .location
@@ -657,12 +694,19 @@ impl<'lock> PylockToml {
                         node_index,
                         &dist.wheels,
                         build_options.no_binary_package(&dist.name),
+                        index_locations,
                     )?;
 
                     // Filter sdist based on build options (--only-binary).
                     let no_build = build_options.no_build_package(&dist.name);
 
                     if !no_build {
+                        Self::validate_proxy_artifact(
+                            index_locations,
+                            &dist.index,
+                            &dist.name,
+                            &dist.file,
+                        )?;
                         let url = dist
                             .file
                             .location
@@ -724,6 +768,7 @@ impl<'lock> PylockToml {
         node_index: NodeIndex,
         wheels: &[RegistryBuiltWheel],
         no_binary: bool,
+        index_locations: &IndexLocations,
     ) -> Result<Option<Vec<PylockTomlWheel>>, PylockTomlErrorKind> {
         if no_binary {
             return Ok(None);
@@ -750,6 +795,12 @@ impl<'lock> PylockToml {
         let wheels = wheels
             .into_iter()
             .map(|wheel| {
+                Self::validate_proxy_artifact(
+                    index_locations,
+                    &wheel.index,
+                    &wheel.filename.name,
+                    &wheel.file,
+                )?;
                 let url = wheel
                     .file
                     .location
@@ -787,9 +838,33 @@ impl<'lock> PylockToml {
         Ok(Some(wheels))
     }
 
+    /// Require a hash for each proxied artifact retained in a new lock.
+    fn validate_proxy_artifact(
+        index_locations: &IndexLocations,
+        index: &IndexUrl,
+        package: &PackageName,
+        file: &File,
+    ) -> Result<(), PylockTomlErrorKind> {
+        if !file.hashes.is_empty() {
+            return Ok(());
+        }
+
+        let Some(route) = index_locations.proxy_route_for(index) else {
+            return Ok(());
+        };
+
+        Err(LockHashError::missing_proxy_hash(
+            package.clone(),
+            file.filename.to_string(),
+            route.effective_url().without_credentials().into_owned(),
+        )
+        .into())
+    }
+
     /// Construct a [`PylockToml`] from a uv lockfile. Relative paths are based on `output_dir`.
     pub fn from_lock(
         target: &impl Installable<'lock>,
+        index_locations: &IndexLocations,
         output_dir: &Path,
         prune: &[PackageName],
         extras: &ExtrasSpecificationWithDefaults,
@@ -853,6 +928,12 @@ impl<'lock> PylockToml {
                         wheels
                             .into_iter()
                             .map(|wheel| {
+                                Self::validate_proxy_artifact(
+                                    index_locations,
+                                    &wheel.index,
+                                    &package.id.name,
+                                    &wheel.file,
+                                )?;
                                 let url = wheel
                                     .file
                                     .location
@@ -1008,6 +1089,12 @@ impl<'lock> PylockToml {
             // Extract the `packages.sdist` field.
             let sdist = match &sdist {
                 Some(SourceDist::Registry(sdist)) => {
+                    Self::validate_proxy_artifact(
+                        index_locations,
+                        &sdist.index,
+                        &package.id.name,
+                        &sdist.file,
+                    )?;
                     let url = sdist
                         .file
                         .location
